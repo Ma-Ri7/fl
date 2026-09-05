@@ -4,6 +4,7 @@ cache/
 coverage/
 .env
 .env.example
+.env.save
 .DS_Store
 logs/
 coverage/
