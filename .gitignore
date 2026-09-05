@@ -1,7 +1,10 @@
 node_modules/
 artifacts/
 cache/
+coverage/
 .env
 .DS_Store
 logs/
 coverage/
+bot/.deployed.json
+.DS_Store
