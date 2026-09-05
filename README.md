@@ -16,8 +16,8 @@ execută **flashloan-uri** (PancakeSwap V2 FlashSwap sau DODO) într-o singură 
 |---|---|
 | Contract security (auth, reentrancy, validation) | FORK VERIFIED |
 | Pancake V2 flashswap + V3 swap | FORK VERIFIED |
-| DODO PMM math engine (JS) | TESTED (parity vs EVM) |
-| DODO real flashloan on fork | PENDING |
+| DODO PMM math engine (JS) | FORK VERIFIED (parity vs EVM) |
+| DODO real flashloan on fork | FORK VERIFIED |
 | V3 multi-tick quote engine | IMPLEMENTED |
 | Block snapshot consistency | IMPLEMENTED |
 | Nonce manager | IMPLEMENTED |
@@ -67,6 +67,7 @@ execută **flashloan-uri** (PancakeSwap V2 FlashSwap sau DODO) într-o singură 
 | `launchd/` | Serviciu macOS 24/7 (`start/stop/status`) |
 | `scripts/deploy.js` | Deploy pe BSC |
 | `scripts/smoke.js` | Test read-only pe rețeaua reală |
+| `scripts/fork-dodo-flash.js` | Test DODO real flashloan + arbitraj pe fork BSC |
 | `test/` | Teste unitare (MockDEX) + test fork BSC |
 
 ## DEX-uri & token-uri default
@@ -124,7 +125,7 @@ Vezi ghidul detaliat pas-cu-pas: **`TUTORIAL.md`**.
 |---|---|
 | `npm run compile` | Compilează contractele |
 | `npm test` | Teste unitare (mock DEX) |
-| `npm run test:fork` | Teste pe fork BSC (necesită RPC cu arhivă) |
+| `npm run test:fork` | Teste pe fork BSC — DODO PMM parity + DODO flashloan (necesită RPC cu arhivă) |
 | `npm run deploy` | Deploy pe BSC + scrie `CONTRACT_ADDRESS` în `.env` |
 | `npm run smoke` | Smoke test read-only pe rețeaua reală |
 | `npm run discover -- <router>` | Descoperă factory-ul + perechile unui DEX nou pe lanț |

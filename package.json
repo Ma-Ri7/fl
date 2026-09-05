@@ -8,6 +8,7 @@
     "postinstall": "node scripts/apply-hardhat-fork-patch.js",
     "fork:patch": "node scripts/apply-hardhat-fork-patch.js",
     "fork:probe": "hardhat run scripts/fork-probe3.js",
+    "fork:dodo": "hardhat run scripts/fork-dodo-flash.js",
     "compile": "hardhat compile",
     "test": "hardhat test",
     "test:fork": "hardhat test test/integration/dodo-pmm-parity.js",
