@@ -11,7 +11,7 @@ const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const dodo = require("../../lib/dodo");
 
-describe("DODO PMM parity (JS vs EVM)", function () {
+describe("Test A: DODO PMM parity (JS vs EVM)", function () {
   let harness;
 
   before(async function () {

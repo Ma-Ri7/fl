@@ -18,7 +18,7 @@ execută **flashloan-uri** (PancakeSwap V2 FlashSwap sau DODO) într-o singură 
 | Pancake V2 flashswap + V3 swap | FORK VERIFIED |
 | DODO PMM math engine (JS) | PASS (Test A — parity JS vs EVM) |
 | DODO protocol mock flow | PASS (Test B — DODODVMMock) |
-| REAL DODO V2 fork flow | NOT YET PASS (Test C — requires real pool) |
+| REAL DODO V2 fork flow | ✅ PASS (Test C — real pool, 70 USDT profit, 0.5% LP fee) |
 | V3 multi-tick quote engine | IMPLEMENTED |
 | Block snapshot consistency | IMPLEMENTED |
 | Nonce manager | IMPLEMENTED |
@@ -128,7 +128,7 @@ Vezi ghidul detaliat pas-cu-pas: **`TUTORIAL.md`**.
 | `npm test` | Teste unitare (MockDEX, MockV3Pool, access control, validation) |
 | `npm run test:fork` | Test A — DODO PMM parity (JS vs EVM, necessită RPC cu arhivă) |
 | `npm run test:dodo-mock` | Test B — DODO protocol mock flow (DODODVMMock) |
-| `npm run test:dodo-fork` | Test C — REAL DODO V2 fork flow (NOT YET PASS, necesită pool real) |
+| `npm run test:dodo-fork` | Test C — REAL DODO V2 fork flow (✅ PASS — real pool, ~70 USDT profit) |
 | `npm run deploy` | Deploy pe BSC + scrie `CONTRACT_ADDRESS` în `.env` |
 | `npm run smoke` | Smoke test read-only pe rețeaua reală |
 | `npm run discover -- <router>` | Descoperă factory-ul + perechile unui DEX nou pe lanț |
