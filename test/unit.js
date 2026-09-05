@@ -11,7 +11,6 @@ async function deployFixture() {
 
   const MockERC20 = await ethers.getContractFactory("MockERC20");
   const MockDEX = await ethers.getContractFactory("MockDEX");
-  const MockDODO = await ethers.getContractFactory("MockDODO");
   const MockV3Pool = await ethers.getContractFactory("MockV3Pool");
   const FlashLoanArbitrage =
     await ethers.getContractFactory("FlashLoanArbitrage");
@@ -32,9 +31,6 @@ async function deployFixture() {
   await source.waitForDeployment();
   await buyDex.waitForDeployment();
   await sellDex.waitForDeployment();
-
-  const dodo = await MockDODO.deploy(usdtAddr, tokAddr);
-  await dodo.waitForDeployment();
 
   const v3Pool = await MockV3Pool.deploy(
     usdtAddr,
@@ -96,14 +92,6 @@ async function deployFixture() {
   );
 
   /*
-   * Fund mock DODO with the asset it is going to lend.
-   */
-  await usdt.mint(
-    await dodo.getAddress(),
-    ethers.parseEther("100000")
-  );
-
-  /*
    * Fund the V3 mock with TOK.
    */
   await tok.mint(
@@ -120,7 +108,6 @@ async function deployFixture() {
     source,
     buyDex,
     sellDex,
-    dodo,
     v3Pool,
     arb,
   };
@@ -568,258 +555,8 @@ describe("FlashLoanArbitrage — unit/security suite", function () {
     });
   });
 
-  describe("DODO callback authentication", function () {
-    it("rejects DODO flashloan token-side mismatch", async function () {
-      const {
-        usdt,
-        tok,
-        buyDex,
-        sellDex,
-        dodo,
-        arb,
-      } = await deployFixture();
-
-      const usdtAddr = await usdt.getAddress();
-      const tokAddr = await tok.getAddress();
-
-      const legA = v2Leg(
-        usdtAddr,
-        tokAddr,
-        await buyDex.getAddress()
-      );
-
-      const legB = v2Leg(
-        tokAddr,
-        usdtAddr,
-        await sellDex.getAddress()
-      );
-
-      await expect(
-        arb.flashArbitrageDodo(
-          await dodo.getAddress(),
-          ethers.parseEther("1000"),
-          0n,
-          tokAddr,
-          usdtAddr,
-          usdtAddr,
-          tokAddr,
-          legA,
-          legB,
-          1n,
-          await latestDeadline()
-        )
-      ).to.be.reverted;
-    });
-
-    it("rejects a DODO flashloan with an invalid pool address", async function () {
-      const {
-        usdt,
-        tok,
-        buyDex,
-        sellDex,
-        dodo,
-        attacker,
-        arb,
-      } = await deployFixture();
-
-      const usdtAddr = await usdt.getAddress();
-      const tokAddr = await tok.getAddress();
-
-      const legA = v2Leg(
-        usdtAddr,
-        tokAddr,
-        await buyDex.getAddress()
-      );
-
-      const legB = v2Leg(
-        tokAddr,
-        usdtAddr,
-        await sellDex.getAddress()
-      );
-
-      await expect(
-        arb.flashArbitrageDodo(
-          attacker.address,
-          ethers.parseEther("1000"),
-          0n,
-          usdtAddr,
-          tokAddr,
-          usdtAddr,
-          tokAddr,
-          legA,
-          legB,
-          1n,
-          await latestDeadline()
-        )
-      ).to.be.reverted;
-    });
-
-    it("rejects a DODO flashloan whose quote amount is inconsistent", async function () {
-      const {
-        usdt,
-        tok,
-        buyDex,
-        sellDex,
-        dodo,
-        arb,
-      } = await deployFixture();
-
-      const usdtAddr = await usdt.getAddress();
-      const tokAddr = await tok.getAddress();
-
-      const legA = v2Leg(
-        usdtAddr,
-        tokAddr,
-        await buyDex.getAddress()
-      );
-
-      const legB = v2Leg(
-        tokAddr,
-        usdtAddr,
-        await sellDex.getAddress()
-      );
-
-      /*
-       * The mock has no TOK liquidity. Asking the contract to borrow
-       * both sides while its configured input/output semantics only
-       * expect USDT must be rejected.
-       */
-      await expect(
-        arb.flashArbitrageDodo(
-          await dodo.getAddress(),
-          ethers.parseEther("1000"),
-          ethers.parseEther("100"),
-          usdtAddr,
-          tokAddr,
-          usdtAddr,
-          tokAddr,
-          legA,
-          legB,
-          1n,
-          await latestDeadline()
-        )
-      ).to.be.reverted;
-    });
-  });
-
-  describe("DODO execution interface", function () {
-    it("does not rely on the obsolete sellBase(address,uint256) interface", async function () {
-      const MockDODO = await ethers.getContractFactory("MockDODO");
-      const {
-        usdt,
-        tok,
-        dodo,
-      } = await deployFixture();
-
-      /*
-       * This test documents the interface exposed by the mock:
-       * the pool uses base/quote tokens and the actual input is determined
-       * by the pool's balance/reserve semantics.
-       *
-       * We deliberately do not call a fake profitable DODO trade here.
-       * Real PMM economics belong in the BSC fork suite.
-       */
-      expect(await dodo.baseToken()).to.equal(
-        await usdt.getAddress()
-      );
-
-      expect(await dodo.quoteToken()).to.equal(
-        await tok.getAddress()
-      );
-
-      expect(MockDODO).to.not.equal(undefined);
-    });
-  });
-
-  describe("Pancake V3 callback protection", function () {
-    it("rejects a non-canonical V3 pool", async function () {
-      const {
-        usdt,
-        tok,
-        source,
-        sellDex,
-        dodo,
-        v3Pool,
-        arb,
-      } = await deployFixture();
-
-      const usdtAddr = await usdt.getAddress();
-      const tokAddr = await tok.getAddress();
-
-      const legA = v3Leg(
-        await v3Pool.getAddress(),
-        true
-      );
-
-      const legB = v2Leg(
-        tokAddr,
-        usdtAddr,
-        await sellDex.getAddress()
-      );
-
-      await expect(
-        arb.flashArbitrageDodo(
-          await dodo.getAddress(),
-          ethers.parseEther("1000"),
-          0n,
-          usdtAddr,
-          tokAddr,
-          usdtAddr,
-          tokAddr,
-          legA,
-          legB,
-          ethers.parseEther("1"),
-          await latestDeadline()
-        )
-      ).to.be.reverted;
-    });
-
-    it("rejects an invalid V3 direction", async function () {
-      const {
-        usdt,
-        tok,
-        sellDex,
-        dodo,
-        v3Pool,
-        arb,
-      } = await deployFixture();
-
-      const usdtAddr = await usdt.getAddress();
-      const tokAddr = await tok.getAddress();
-
-      /*
-       * The mock is intentionally not a canonical Pancake V3 pool.
-       * The important property here is that an invalid direction
-       * cannot become an executable V3 leg.
-       */
-      const legA = v3Leg(
-        await v3Pool.getAddress(),
-        false
-      );
-
-      const legB = v2Leg(
-        tokAddr,
-        usdtAddr,
-        await sellDex.getAddress()
-      );
-
-      await expect(
-        arb.flashArbitrageDodo(
-          await dodo.getAddress(),
-          ethers.parseEther("1000"),
-          0n,
-          usdtAddr,
-          tokAddr,
-          usdtAddr,
-          tokAddr,
-          legA,
-          legB,
-          1n,
-          await latestDeadline()
-        )
-      ).to.be.reverted;
-    });
-  });
+  // DODO-specific tests moved to test/integration/dodo-mock-flow.js (Test B)
+  // Real DODO V2 fork tests in test/integration/dodo-v2-fork.js (Test C)
 
   describe("Rescue / owner safety", function () {
     it("only the owner can rescue token dust", async function () {

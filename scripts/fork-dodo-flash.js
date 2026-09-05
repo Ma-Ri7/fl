@@ -72,6 +72,7 @@ async function main() {
   const wbnbOut = qA[0];
   const outB = await router.getAmountsOut(wbnbOut, [WBNB, USDT]);
   const usdtBack = outB[outB.length - 1];
+  const netProfit = usdtBack - borrow;
   // Execute flashArbitrageDodo
   const ownerBefore = await usdt.balanceOf(owner.address);
   const deadline = Math.floor(Date.now() / 1000) + 86400;
