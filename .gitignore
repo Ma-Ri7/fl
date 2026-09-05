@@ -6,6 +6,4 @@ coverage/
 .env.save
 .DS_Store
 logs/
-coverage/
 bot/.deployed.json
-.DS_Store
