@@ -52,8 +52,10 @@ async function deployFixture() {
     await dex.addLiquidity(amount0, amount1);
   };
 
-  await seed(buyDex, ethers.parseEther("100000"), ethers.parseEther("500000000"));
-  await seed(sellDex, ethers.parseEther("100000"), ethers.parseEther("1000000000"));
+  // buyDex: TOK is cheap (more TOK per USDT) — arbitrage buys TOK here
+  await seed(buyDex, ethers.parseEther("100000"), ethers.parseEther("200000"));
+  // sellDex: TOK is expensive (fewer TOK per USDT) — arbitrage sells TOK here
+  await seed(sellDex, ethers.parseEther("120000"), ethers.parseEther("100000"));
   await usdt.mint(await dvm.getAddress(), ethers.parseEther("100000"));
 
   return { owner, stranger, attacker, usdt, tok, dvm, buyDex, sellDex, arb };
@@ -91,22 +93,43 @@ describe("Test B: DODO protocol mock flow (DODODVMMock)", function () {
   });
 
   describe("FlashLoan callback flow", function () {
-    it("documents contract limitation: pancakeCall and DVMFlashLoanCall have same selector", async function () {
-      // NOTE: The FlashLoanArbitrage contract has both pancakeCall(address,uint256,uint256,bytes)
-      // and DVMFlashLoanCall(address,uint256,uint256,bytes). They share the same function
-      // selector, so the EVM routes DVM mock callbacks to pancakeCall instead of
-      // DVMFlashLoanCall. This is a known contract limitation.
-      //
-      // The full flashLoan execution flow is validated on BSC fork (Test C) against
-      // the real DODO V2 contract, where the callback routing is handled correctly.
-      //
-      // For this mock test, we validate that the DODODVMMock correctly transfers
-      // assets and calls back, even though the arbitrage contract cannot process
-      // the callback due to the selector collision.
-      const { dvm, usdt } = await deployFixture();
+    it("executes full flashLoan: borrow USDT -> swap -> repay -> profit", async function () {
+      const { owner, usdt, tok, dvm, buyDex, sellDex, arb } = await deployFixture();
+      const usdtAddr = await usdt.getAddress();
+      const tokAddr = await tok.getAddress();
       const dvmAddr = await dvm.getAddress();
-      const dvmBalBefore = await usdt.balanceOf(dvmAddr);
-      expect(dvmBalBefore).to.be.gt(0n);
+      const arbAddr = await arb.getAddress();
+      const borrowAmount = ethers.parseEther("1000");
+      const legA = v2Leg(usdtAddr, tokAddr, await buyDex.getAddress());
+      const legB = v2Leg(tokAddr, usdtAddr, await sellDex.getAddress());
+      const ownerUsdtBefore = await usdt.balanceOf(owner.address);
+      const dvmUsdtBefore = await usdt.balanceOf(dvmAddr);
+
+      const tx = await arb.flashArbitrageDodo(
+        dvmAddr, borrowAmount, 0n, usdtAddr, tokAddr, usdtAddr, tokAddr,
+        legA, legB, 1n, await latestDeadline()
+      );
+      const rc = await tx.wait();
+
+      // Repayment exact
+      expect(await usdt.balanceOf(dvmAddr)).to.be.gte(dvmUsdtBefore);
+      // Contract has no dust
+      expect(await usdt.balanceOf(arbAddr)).to.equal(0n);
+      expect(await tok.balanceOf(arbAddr)).to.equal(0n);
+
+      // ArbitrageExecuted event
+      let evProfit = null;
+      for (const lg of rc.logs) {
+        try {
+          const ev = arb.interface.parseLog(lg);
+          if (ev && ev.name === "ArbitrageExecuted") evProfit = ev.args.profit;
+        } catch (e) { /* other contract log */ }
+      }
+      expect(evProfit).to.not.be.null;
+
+      // Profit transferred to owner
+      const profit = (await usdt.balanceOf(owner.address)) - ownerUsdtBefore;
+      expect(profit).to.equal(BigInt(evProfit));
     });
 
     it("records PMM state correctly during flashLoan lifecycle", async function () {

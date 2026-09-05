@@ -8,12 +8,14 @@
 // ============================================================================
 const hre = require("hardhat");
 
-const WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
-const USDT = "0x55d398326f99059fF775485246999027B3197955";
-const PC_V3_POOL_F100 = "0x172fcd41e0913e95784454622d1c3724f546f849";
-const BISWAP_FACTORY = "0x858E3312ed3A876947EA49d572A7C42DE08af7EE";
-const BISWAP_ROUTER = "0x3a6d8cA21D1CF76F653A67577FA0D27453350dD8";
-const QUOTER_V2 = "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997";
+const { ethers } = hre;
+const g = (a) => ethers.getAddress(a);
+const WBNB = g("0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c");
+const USDT = g("0x55d398326f99059ff775485246999027b3197955");
+const PC_V3_POOL_F100 = g("0x172fcd41e0913e95784454622d1c3724f546f849");
+const BISWAP_FACTORY = g("0x858e3312ed3a876947ea49d572a7c42de08af7ee");
+const BISWAP_ROUTER = g("0x3a6d8ca21d1cf76f653a65577fa0d27453350dd8");
+const QUOTER_V2 = g("0xb048bbc1ee6b733fffcfb9e9cef7375518e25997");
 
 const ERC20_ABI = ["function balanceOf(address) view returns (uint256)","function transfer(address,uint256) returns (bool)"];
 const ROUTER_ABI = ["function factory() view returns (address)","function getAmountsOut(uint256,address[]) view returns (uint256[])"];
