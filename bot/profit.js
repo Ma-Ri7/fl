@@ -1,6 +1,7 @@
 // FLASH — profit estimation for V2/V3/DODO venues.
 // Finds the best 2-hop arbitrage across all venues sharing a token pair.
 const { getAmountOut, getAmountOutV3, v3Depth } = require("../lib/amm");
+const dodo = require("../lib/dodo");
 const { pairKey } = require("./scanner");
 const config = require("./config");
 
@@ -29,7 +30,24 @@ function venueOutput(venue, tokenIn, amountIn) {
     const feeUnits = BigInt(venue.feeTier || 500);
     return getAmountOutV3(amountIn, venue.sqrtPx96, venue.liquidity, zeroForOne, feeUnits);
   }
-  // DODO pools are kept ONLY as flashloan sources (free flashloans).
+  // PHASE 5 (audit): DODO PMM EXACT — nu mai returnăm 0. Quote off-chain
+  // bit-exact cu DVMTrader.querySellBase/querySellQuote (vezi lib/dodo.js,
+  // validat prin paritate Solidity în test/amm.js și pe fork în
+  // test/integration/dodo-pmm-parity.js). Fără starea PMM a pool-ului,
+  // venue-ul rămâne doar sursă de flashloan.
+  if (venue.kind === "dodo") {
+    if (!venue.pmm || venue.lpFeeRate === undefined) return 0n;
+    try {
+      if (a === venue.baseToken.toLowerCase()) {
+        return dodo.quoteSellBase(venue.pmm, amountIn, venue.lpFeeRate, venue.mtFeeRate || 0n).out;
+      }
+      if (a === venue.quoteToken.toLowerCase()) {
+        return dodo.quoteSellQuote(venue.pmm, amountIn, venue.lpFeeRate, venue.mtFeeRate || 0n).out;
+      }
+    } catch (_) {
+      return 0n; // ex: trade > target pe DVM → on-chain query ar si reverts
+    }
+  }
   return 0n;
 }
 
@@ -136,7 +154,16 @@ function findOpportunities(venues, tokens, opts = {}) {
             if (baseRecv <= 0n) continue;
             const quoteRecv = venueOutput(sellVen, baseT.address, baseRecv);
             if (quoteRecv <= borrow) continue;
-            const flashFee = dodoSrc.length > 0 ? 0n : (borrow * BigInt(FLASH_FEE_V2_BPS)) / 10000n;
+            // FLASH FEE POLICY (audit item 4):
+            //  - PancakeSwap V2: 0.25% fix (protocol fee real).
+            //  - DODO: NU este un fee explicit; costul real vine din mecanismul
+            //    de equalizare al pool-ului. Pentru repay EXACT al activelor
+            //    imprumutate costul este 0 — dar nu e un adevăr universal:
+            //    politica e în config.dodo.flashFeeBps (null = 0) și va fi
+            //    validată pe fork în PHASE 2B.
+            const flashFee = dodoSrc.length > 0
+              ? dodo.dodoFlashFee(borrow, config.dodo)
+              : (borrow * BigInt(FLASH_FEE_V2_BPS)) / 10000n;
             const net = quoteRecv - borrow - flashFee;
             if (!best || net > best.net) best = { borrow, baseRecv, quoteRecv, flashFee, net };
           }
@@ -146,12 +173,21 @@ function findOpportunities(venues, tokens, opts = {}) {
             if (price.num > 0n) profitInBnb = (best.net * price.num) / price.den;
             // Skip if we can't value the profit in BNB (no WBNB pair exists)
             if (profitInBnb <= 0n) continue;
+            // BLOCK SNAPSHOT (audit item 6): oportunitatea duce cu ea block-ul
+            // din care provin toate quote-urile sale. Venue-urile citite în
+            // block-uri diferite NU sunt combinate.
+            const snap = opts.snapshot;
+            if (snap) {
+              const stale = (v) => v.dead || (v.snapshot !== undefined && v.snapshot !== snap.blockNumber);
+              if (stale(buyVen) || stale(sellVen)) continue;
+            }
             const opp = {
               borrowToken: borrowT, baseToken: baseT, buyVen, sellVen,
               sourceKind: dodoSrc.length > 0 ? "dodo" : "v2",
               sourceVen: dodoSrc.length > 0 ? dodoSrc[0] : v2Src[0],
               borrowAmount: best.borrow, baseRecv: best.baseRecv, quoteRecv: best.quoteRecv,
               flashFee: best.flashFee, netProfit: best.net, profitInBnb,
+              snapshot: snap ? { blockNumber: snap.blockNumber, blockHash: snap.blockHash, timestamp: snap.timestamp, stateVersion: snap.stateVersion } : null,
             };
             if (isPlausible(opp)) ops.push(opp);
           }
@@ -163,4 +199,4 @@ function findOpportunities(venues, tokens, opts = {}) {
   return ops;
 }
 
-module.exports = { findOpportunities, venueOutput, venueDepth, providesToken, isPlausible };
+module.exports = { findOpportunities, venueOutput, venueDepth, providesToken, isPlausible, tokenPriceInBnb };

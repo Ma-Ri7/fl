@@ -30,10 +30,19 @@ de pe BSC, folosind un singur apel `aggregate3` la **Multicall3** (rapid, ieftin
 prețul unui token diferă între DEX-uri suficient cât să acopere toate costurile, bot-ul:
 
 1. Declanșează **flashloan** de pe o pereche PancakeSwap V2 (împrumut fără garanție,
-   de returnat în aceeași tranzacție, cu fee ~0.25%) **SAU DODO (flashloan GRATUIT, 0% fee)**;
+   de returnat în aceeași tranzacție, cu fee ~0.25%) **SAU DODO (fee 0* — vezi nota)**;
 2. Swap pe DEX A (V2 router, V3 pool, sau DODO pool) — token ieftin;
 3. Swap pe DEX B (V2 router, V3 pool, sau DODO pool) — token scump;
-4. Rambursează împrumutul și **trimite profitul automat** în wallet-ul tău.**Riscuri reale:**
+4. Rambursează împrumutul și **trimite profitul automat** în wallet-ul tău.
+
+> \* **DODO flashloan fee**: DODO nu percepe un fee explicit. Costul real vine din
+> mecanismul de equalizare al pool-ului PMM. Dacă contractul returnează exact activele
+> împrumutate și pool-ul revine la starea inițială, costul net este zero. Această
+> proprietate trebuie validată pe fork pentru fiecare pool DODO în parte — nu e un
+> adevăr universal. Matematica PMM completă (i, K, B, Q, R state, LP fee, maintainer
+> fee) este implementată în `lib/dodo.js` și testată prin paritate JS↔EVM.
+
+**Riscuri reale:**
 - **Competiția**: pe BSC există bot-uri profesionale cu servere în colocation și
   abonamente private mempool (bloXroute / 48Club). Multe oportunități sunt prinse
   în milisecunde.

@@ -43,17 +43,25 @@ const PANCAKE_V3_FEE_TIERS = [100, 500, 2500, 10000]; // 0.01% / 0.05% / 0.25% /
 // QuoterV2 - pricing EXACT pe lichiditate concentrata (ruleaza in eth_call).
 const PANCAKE_V3_QUOTER = A("0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997");
 
-// --- DODO V2 (PMM). Flashloane GRATUITE pe DVM/DSP/DPP -> sursa de imprumut
-// preferata (elimina fee-ul de 0.25% al PancakeSwap V2). Factory-urile au fost
+// --- DODO V2 (PMM). Flashloane pe DVM/DSP/DPP. Factory-urile au fost
 // verificate on-chain: fiecare intoarce pool-uri vii pentru perechile noastre.
+//
+// ATENȚIE (audit item 4/12): NU modelăm DODO printr-un "swap fee" constant.
+// Matematica PMM exactă (i, K, B, Q, B0, Q0, R + LP fee + maintainer fee,
+// citite din pool) e implementată în lib/dodo.js și folosită de bot/profit.js.
 const DODO_FACTORIES = [
   { id: "dvm", name: "DODO DVM", address: A("0x790B4A80Fb1094589A3c0eFC8740aA9b0C1733fB") },
   { id: "dsp", name: "DODO DSP", address: A("0x0fb9815938Ad069Bf90E14FE6C596c514BEDe767") },
   { id: "dpp", name: "DODO DPP", address: A("0xd9CAc3D964327e47399aebd8e1e6dCC4c251DaAE") },
 ];
-// Fee conservativ folosit la estimarea swap-ului pe DODO (PMM nu are fee explicit,
-// dar formula K introduce impact de pret; simularea on-chain confirma exact).
-const DODO_SWAP_FEE_BPS = 5;
+
+// Costul flashloan-ului DODO (PHASE 2B — se validează pe fork):
+// null => 0 (contractul rambursează EXACT activele împrumutate, pool-ul nu
+// primește nimic în callback). Dacă validarea pe fork arată altfel, setează
+// aici bps (ex: 2) și profit.js le va include automat în calcul.
+const DODO_POLICY = {
+  flashFeeBps: null,
+};
 
 const DEXES = [
   {
@@ -116,7 +124,7 @@ module.exports = {
   PANCAKE_V3_FEE_TIERS,
   PANCAKE_V3_QUOTER,
   DODO_FACTORIES,
-  DODO_SWAP_FEE_BPS,
+  dodo: DODO_POLICY,
   TOKENS: {
     // Majore (baza de preturi, utile pentru perechile stabile):
     WBNB: { address: WBNB, decimals: 18, symbol: "WBNB" },
@@ -144,11 +152,15 @@ module.exports = {
     scanTimeoutMs: 8000,
     defaultFlashAmount: 1000000n * 10n ** 18n, // 1M quote token cap per trade
     minProfitBnb: 0.01, // broadcast only if estimated NET profit > 0.01 BNB
-    slippageBps: 100n, // 1% buffer when setting minReturn
+    slippageBps: 100n, // marja de risc aplicată pe quote-ul EXACT la minProfit (PHASE 10)
     maxPerPairBorrowBps: 200, // never borrow more than 200 bps (2%) of a pair's quote reserve
     gasMultiplier: 1.15,
     maxNonceGap: 5,
     sweepMinBnb: 0.005,
     maxTxWaitMs: 60000,
+    // PHASE 10/11 — execuție:
+    requoteMaxAgeBlocks: 2, // final requote mai vechi de N block-uri => skip
+    gasReserveBps: 500, // profit net (în BNB) trebuie să depășească gas estimat cu 5%
+    deadlinePadSec: 75, // deadline scurt (~3 blocuri BSC), nu 5 minute
   },
 };

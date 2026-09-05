@@ -87,7 +87,8 @@ async function main() {
   }
   console.log(`\n${found} live pairs found on ${factory}`);
   console.log("\nTo add this DEX to the bot, add an entry in bot/config.js DEXES:");
-  console.log(`  { id: "xxxx", name: "...", factory: "${factory}", router: "${routerAddr}", feeBps: 25, verified: true }`);
+  console.log(`  { id: "xxxx", name: "...", factory: "${factory}", router: "${routerAddr}", feeBps: 25, verified: false }`);
+  console.log(`NOTE: verified:false until you confirm factory + router + pair semantics + fee + swap behavior.`);
   process.exit(0);
 }
 

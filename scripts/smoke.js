@@ -10,8 +10,8 @@ const config = require("../bot/config");
 (async () => {
   try {
     console.log("=== FLASH smoke test (read-only, no broadcast) ===\n");
-    const { provider, isWs } = await pickProvider();
-    console.log(`Provider : ${isWs ? "WebSocket" : "HTTP"}`);
+    const { provider } = await pickProvider();
+    console.log(`Provider : HTTP`);
     console.log(`Block    : ${await provider.getBlockNumber()}`);
     const net = await provider.getNetwork();
     console.log(`Network  : ${Number(net.chainId) === 56 ? "BSC mainnet" : "chain " + Number(net.chainId)}\n`);

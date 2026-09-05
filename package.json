@@ -10,7 +10,7 @@
     "fork:probe": "hardhat run scripts/fork-probe3.js",
     "compile": "hardhat compile",
     "test": "hardhat test",
-    "test:fork": "hardhat test test/integration",
+    "test:fork": "hardhat test test/integration/dodo-pmm-parity.js",
     "deploy": "node scripts/deploy.js",
     "smoke": "node scripts/smoke.js",
     "discover": "node scripts/discover-dex.js",

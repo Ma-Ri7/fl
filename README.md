@@ -2,13 +2,34 @@
 
 Bot automat care monitorizează token-uri (cu focus pe cele **mai puțin urmărite**)
 pe mai multe DEX-uri de pe BNB Chain și, când detectează o oportunitate de arbitraj,
-execută **flashloan-uri** (PancakeSwap V2 FlashSwap sau DODO gratuit) într-o singură tranzacție atomică.
+execută **flashloan-uri** (PancakeSwap V2 FlashSwap sau DODO) într-o singură tranzacție atomică.
 
-Construit pentru a rula **24/7 pe un Mac Mini M4** (sau orice Mac) ca serviciu macOS.
 
 > ⚠️ **Avertisment sincer**: arbitrajul pe BSC este extrem de competitiv. Acest proiect
 > este o infrastructură educațională și funcțională, dar **nu garantează profit**.
 > Nu investi fonduri pe care nu ești dispus să le pierzi. Citește `TUTORIAL.md`.
+
+
+## Maturity levels
+
+| Component | Level |
+|---|---|
+| Contract security (auth, reentrancy, validation) | FORK VERIFIED |
+| Pancake V2 flashswap + V3 swap | FORK VERIFIED |
+| DODO PMM math engine (JS) | TESTED (parity vs EVM) |
+| DODO real flashloan on fork | PENDING |
+| V3 multi-tick quote engine | IMPLEMENTED |
+| Block snapshot consistency | IMPLEMENTED |
+| Nonce manager | IMPLEMENTED |
+| TX tracker + realized P&L | IMPLEMENTED |
+| Final requote + eth_call | IMPLEMENTED |
+| Size optimizer | PENDING |
+| Cost/economics engine (exact gas) | IMPLEMENTED |
+| Opportunity ranking | PENDING |
+| Shadow mode | IMPLEMENTED |
+| Paper execution | PENDING |
+| Micro-live | PENDING |
+| 24/7 production | PENDING |
 
 ## Arhitectură
 
@@ -24,7 +45,7 @@ Construit pentru a rula **24/7 pe un Mac Mini M4** (sau orice Mac) ca serviciu m
                 │  semnare tranzacție (doar BNB pt gas)
                 ▼
 ┌────────────── On-chain: FlashLoanArbitrage.sol ─────────────────────┐
-│  1. ia flashloan de pe PancakeSwap V2 (0.25%) SAU DODO (GRATUIT)    │
+│  1. ia flashloan de pe PancakeSwap V2 (0.25%) SAU DODO (fee 0*)   │
 │  2. swap pe DEX A (V2 router sau V3 pool sau DODO pool)             │
 │  3. swap pe DEX B (V2 router sau V3 pool sau DODO pool)             │
 │  4. rambursează flashloan-ul + fee                                   │
@@ -56,14 +77,18 @@ Construit pentru a rula **24/7 pe un Mac Mini M4** (sau orice Mac) ca serviciu m
 |---|---|---|---|
 | **V2 AMM** (6) | PancakeSwap V2, BiSwap, SushiSwap, ApeSwap, BabySwap, FstSwap | 0.1–0.3% | 0.25% (PancakeSwap V2) |
 | **V3 CLM** (1) | PancakeSwap V3 (4 fee tiers: 0.01%, 0.05%, 0.25%, 1%) | dinamic | — (picior de swap) |
-| **DODO PMM** (3) | DVMFactory, DSPFactory, DPPFactory | ~0.2% | **0% (GRATUIT)** |
+| **DODO PMM** (3) | DVMFactory, DSPFactory, DPPFactory | ~0.2% | **fee 0\*** |
 
-- **Total venue-uri live**: ~500+ (descoperite automat la pornire, în <2s)
+- **Venue-uri**: 6 DEX-uri V2 + 1 V3 + 3 DODO factory-uri (descoperite on-chain, la pornire).
 - **Token-uri**: WBNB, USDT, BUSD, USDC, BTCB, ETH, CAKE + **less-tracked**:
   ACH, ALICE, ALPACA, ALPHA, AITECH, HIGH, HOOK, HFT, HOO, HOTCROSS, HTD
   (adrese din lista oficială PancakeSwap extended; bot-ul le verifică on-chain)
 - **Coverage**: ~60+ perechi arbitraj-gata (cu ≥2 venue-uri vii), scanate pe fiecare block.
   Bot-ul arbitrează orice pereche (bază × quote) pe care cel puțin 2 DEX-uri o au — indiferent de tip (V2↔V2, V2↔V3, V2↔DODO, etc.).
+
+> \* DODO flashloan are fee zero doar dacă pool-ul revine la starea inițială. DODO
+> PMM este modelat complet (i, K, B, Q, R state, LP fee, maintainer fee) — nu printr-un
+> `DODO_SWAP_FEE_BPS` constant.
 
 ## Pornire rapidă
 

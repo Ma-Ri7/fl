@@ -31,12 +31,16 @@ function encodeCall(c) {
 
 /**
  * Run many eth_calls through Multicall3. Failed calls return success:false.
+ * opts.blockTag: dacă e setat, TOATE citirile sunt fixate pe acel block
+ * (BLOCK SNAPSHOT — audit item 6: quote-urile unei oportunități trebuie să
+ * provină din aceeași stare logică a lanțului).
  */
 async function multicall3(provider, calls, opts = {}) {
   const chunkSize = opts.chunkSize || 200;
   const retries = opts.retries || 3;
   const sleepMs = opts.sleepMs || 250;
   const mc3 = new ethers.Contract(MULTICALL3, MC3_ABI, provider);
+  const callOpts = opts.blockTag ? { blockTag: opts.blockTag } : {};
   const out = new Array(calls.length);
   let idx = 0;
   for (const batch of chunk(calls, chunkSize)) {
@@ -48,7 +52,7 @@ async function multicall3(provider, calls, opts = {}) {
     let done = false;
     for (let attempt = 0; attempt < retries && !done; attempt++) {
       try {
-        const res = await mc3.aggregate3(tupleCalls);
+        const res = await mc3.aggregate3(tupleCalls, callOpts);
         for (const r of res) out[idx++] = { success: r.success, returnData: r.returnData };
         done = true;
       } catch (_) {
@@ -182,9 +186,18 @@ const DODO_POOL_ABI = [
   "function _QUOTE_TOKEN_() view returns (address)",
   "function _BASE_RESERVE_() view returns (uint256)",
   "function _QUOTE_RESERVE_() view returns (uint256)",
+  // PHASE 5: starea PMM exacta (audit: nu modelam DODO deloc).
+  // getPMMStateForCall() => (i, K, B, Q, B0, Q0, R) — public pe DVM/DSP (si DPP).
+  "function getPMMStateForCall() view returns (uint256 i, uint256 K, uint256 B, uint256 Q, uint256 B0, uint256 Q0, uint256 R)",
+  // Fee-urile reale ale pool-ului pentru traderul nostru (LP + maintainer).
+  "function getUserFeeRate(address user) view returns (uint256 lpFeeRate, uint256 mtFeeRate)",
 ];
 
-/** Read on-chain state for every venue. Mutates venue objects in place. */
+/**
+ * Read on-chain state for every venue. Mutates venue objects in place.
+ * opts.blockTag — citește TOT starea la acel block (BLOCK SNAPSHOT).
+ * opts.trader   — adresa contractului de arbitraj (pentru mtFeeRate de user).
+ */
 async function readState(provider, venues, opts = {}) {
   const calls = [];
   const meta = [];
@@ -198,14 +211,24 @@ async function readState(provider, venues, opts = {}) {
       calls.push({ target: v.pool, fragment: V3_POOL_ABI[1] });
       meta.push({ v, field: "liquidity" });
     } else {
-      for (const [frag, field] of DODO_POOL_ABI.map((f, k) => [f, ["baseToken", "quoteToken", "baseReserve", "quoteReserve"][k]])) {
+      for (const [frag, field] of DODO_POOL_ABI.slice(0, 4).map((f, k) => [f, ["baseToken", "quoteToken", "baseReserve", "quoteReserve"][k]])) {
         calls.push({ target: v.pool, fragment: frag });
         meta.push({ v, field });
       }
+      // Starea PMM (PHASE 5). allowFailure — unele pool-uri (DPP vechi/DSP
+      // fără oracol) pot să nu expună getPMMStateForCall.
+      calls.push({ target: v.pool, fragment: DODO_POOL_ABI[4] });
+      meta.push({ v, field: "pmm" });
+      calls.push({
+        target: v.pool,
+        fragment: DODO_POOL_ABI[5],
+        args: [opts.trader || ethers.ZeroAddress],
+      });
+      meta.push({ v, field: "fees" });
     }
   }
   const res = await multicall3(provider, calls, { chunkSize: 200, ...opts });
-  const stats = { ok: 0, empty: 0, fail: 0 };
+  const stats = { ok: 0, empty: 0, fail: 0, pmmOk: 0 };
   let i = 0;
   for (const { success, returnData } of res) {
     const { v, field } = meta[i++];
@@ -232,11 +255,24 @@ async function readState(provider, venues, opts = {}) {
         else if (field === "quoteToken") v.quoteToken = cod.decode(["address"], returnData)[0];
         else if (field === "baseReserve") v.baseReserve = cod.decode(["uint256"], returnData)[0];
         else if (field === "quoteReserve") v.quoteReserve = cod.decode(["uint256"], returnData)[0];
+        else if (field === "pmm") {
+          const d = cod.decode(["uint256", "uint256", "uint256", "uint256", "uint256", "uint256", "uint256"], returnData);
+          v.pmm = { i: d[0], K: d[1], B: d[2], Q: d[3], B0: d[4], Q0: d[5], R: d[6] };
+          stats.pmmOk++;
+        } else if (field === "fees") {
+          const d = cod.decode(["uint256", "uint256"], returnData);
+          v.lpFeeRate = d[0];
+          v.mtFeeRate = d[1];
+        }
         if (v.baseReserve !== undefined && v.quoteReserve !== undefined) {
           if (v.baseReserve > 0n && v.quoteReserve > 0n) stats.ok++; else { v.dead = true; stats.empty++; }
         }
       }
     } catch (_) { stats.fail++; }
+  }
+  // marchează snapshot-ul pe venue-urile vii (audit: BLOCK SNAPSHOT formal)
+  if (opts.blockTag) {
+    for (const v of venues) if (!v.dead) v.snapshot = opts.blockTag;
   }
   return stats;
 }

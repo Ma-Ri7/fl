@@ -17,6 +17,14 @@ const BUNDLE_API = "https://api.blxrbdn.com" + "/bundle"; // legacy fallback
  * Send a private transaction via BloXroute.
  * The tx is forwarded directly to BSC validators and never enters the public mempool.
  *
+ * STATUS SEMANTICS (audit item 7 — CRITICAL):
+ *  - ok:true, status:'accepted' → tx primit de BloXroute (txHash cunoscut).
+ *  - ok:false, status:'failed'  → respins ÎNAINTE de acceptare (definitiv).
+ *    DOAR acest caz permite fallback la public mempool.
+ *  - ok:false, status:'unknown' → eroare de rețea/timpout: tx POATE fi fost
+ *    acceptat. NU se mai trimite public cu același nonce (risc dublă execuție);
+ *    tracker-ul urmărește hash-ul, iar NonceManager nu reutilizează nonce-ul.
+ *
  * @param {object} opts
  * @param {ethers.Wallet} opts.wallet        - signer (only address + signTransaction used)
  * @param {string} opts.to                  - target contract address
@@ -25,12 +33,13 @@ const BUNDLE_API = "https://api.blxrbdn.com" + "/bundle"; // legacy fallback
  * @param {bigint} opts.maxFeePerGas        - max fee per gas (EIP-1559)
  * @param {bigint} opts.maxPriorityFeePerGas- miner tip (EIP-1559)
  * @param {number} [opts.targetBlock]       - specific block number to target (default: next block)
+ * @param {number} [opts.nonce]             - nonce rezervat de NonceManager (obligatoriu în producție)
  * @param {string} [opts.bloxrouteToken]    - BloXroute auth token (or BLOXROUTE_API_TOKEN env)
- * @returns {Promise<{ok: boolean, txHash?: string, block?: number, error?: string}>}
+ * @returns {Promise<{ok: boolean, status:'accepted'|'failed'|'unknown', txHash?: string, block?: number, error?: string}>}
  */
 async function sendPrivateTx(opts) {
   const token = opts.bloxrouteToken || process.env.BLOXROUTE_API_TOKEN;
-  if (!token) return { ok: false, error: "no-token" };
+  if (!token) return { ok: false, status: "failed", error: "no-token" };
 
   const wallet = opts.wallet;
   const feeData = await wallet.provider.getFeeData();
@@ -45,7 +54,7 @@ async function sendPrivateTx(opts) {
     gasLimit: opts.gasLimit,
     maxFeePerGas,
     maxPriorityFeePerGas,
-    nonce: await wallet.getNonce(),
+    nonce: opts.nonce !== undefined ? opts.nonce : await wallet.getNonce("pending"),
     chainId: 56,
   };
 
@@ -74,10 +83,11 @@ async function sendPrivateTx(opts) {
       body: JSON.stringify(body),
     });
     const json = await res.json();
-    if (json.error) return { ok: false, error: json.error.message };
-    return { ok: true, txHash: json.result?.tx_hash, block: json.result?.block_number };
+    if (json.error) return { ok: false, status: "failed", error: json.error.message };
+    return { ok: true, status: "accepted", txHash: json.result?.tx_hash, block: json.result?.block_number };
   } catch (e) {
-    return { ok: false, error: e.message };
+    // rețea/timpout → stare NECUNOSCUTĂ: nu se fac alte submit-uri cu acest nonce
+    return { ok: false, status: "unknown", error: e.message };
   }
 }
 
