@@ -1,0 +1,36 @@
+{
+  "name": "flash-bsc-arbitrage",
+  "version": "1.0.0",
+  "description": "Bot de flashloan arbitrage pe BSC (BNB Chain), cu focus pe token-uri mai putin urmarite",
+  "main": "bot/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "postinstall": "node scripts/apply-hardhat-fork-patch.js",
+    "fork:patch": "node scripts/apply-hardhat-fork-patch.js",
+    "fork:probe": "hardhat run scripts/fork-probe3.js",
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:fork": "hardhat test test/integration",
+    "deploy": "node scripts/deploy.js",
+    "smoke": "node scripts/smoke.js",
+    "discover": "node scripts/discover-dex.js",
+    "bot": "node bot/index.js",
+    "sweep": "node bot/sweeper.js",
+    "start": "bash launchd/start.sh",
+    "stop": "bash launchd/stop.sh",
+    "status": "bash launchd/status.sh"
+  },
+  "keywords": ["bsc", "arbitrage", "flashloan", "mev", "trading", "bot"],
+  "author": "",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.6.1",
+    "dotenv": "^17.4.2",
+    "ethers": "^6.17.0"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.29.1"
+  }
+}
