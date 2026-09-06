@@ -14,6 +14,7 @@
     "test:fork": "hardhat test test/integration/dodo-pmm-parity.js",
     "test:dodo-mock": "hardhat test test/integration/dodo-mock-flow.js",
     "test:dodo-fork": "hardhat test test/integration/dodo-v2-fork.js",
+    "test:v3-parity": "hardhat test test/integration/v3-quoter-parity.js",
     "deploy": "node scripts/deploy.js",
     "smoke": "node scripts/smoke.js",
     "discover": "node scripts/discover-dex.js",

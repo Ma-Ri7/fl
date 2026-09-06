@@ -1,6 +1,7 @@
 // FLASH — profit estimation for V2/V3/DODO venues.
 // Finds the best 2-hop arbitrage across all venues sharing a token pair.
 const { getAmountOut, getAmountOutV3, v3Depth } = require("../lib/amm");
+const { getAmountOutV3Exact } = require("../lib/v3"); // TASK 4.4: quote EXACT
 const dodo = require("../lib/dodo");
 const { pairKey } = require("./scanner");
 const config = require("./config");
@@ -28,7 +29,36 @@ function venueOutput(venue, tokenIn, amountIn) {
   if (venue.kind === "v3") {
     const zeroForOne = a === venue.tokenA.address.toLowerCase();
     const feeUnits = BigInt(venue.feeTier || 500);
-    return getAmountOutV3(amountIn, venue.sqrtPx96, venue.liquidity, zeroForOne, feeUnits);
+    // TASK 4.4: când scannerul a citit starea PROFUNDĂ (tickSpacing + tickBitmap
+    // words + initialized ticks cu liquidityNet — vezi scanner.enrichV3Venues),
+    // folosim motorul EXACT din lib/v3 (swap-step cu tick crossing), identic
+    // cu QuoterV2. Fallback: modelul simplificat cu lichiditate constantă.
+    const s = venue.v3State;
+    if (s && Array.isArray(s.words) && Array.isArray(s.ticks) && s.words.length > 0) {
+      try {
+        const words = new Map(s.words.map((w) => [w.word, BigInt(w.value)]));
+        const ticks = new Map(s.ticks.map((t) => [t.tick, BigInt(t.liquidityNet)]));
+        const r = getAmountOutV3Exact({
+          amountIn,
+          zeroForOne,
+          fee: Number(venue.feeTier || 500),
+          tickSpacing: s.tickSpacing,
+          words,
+          ticks,
+          sqrtPx96: s.sqrtPriceX96,
+          liquidity: s.liquidity,
+          tick: s.tick,
+        });
+        if (r && r.amountOut > 0n) return r.amountOut;
+      } catch (_) {
+        // prea multe tick-uri traversate / stare parțială → model simplificat
+      }
+    }
+    // TASK 4.4: fallback-ul legacy cere BigInt; coercie defensivă (venue-ul poate
+    // veni din JSON/cache unde BigInt devine string) ca să nu aruncăm TypeError.
+    const px = venue.sqrtPx96 != null ? BigInt(venue.sqrtPx96) : 0n;
+    const liq = venue.liquidity != null ? BigInt(venue.liquidity) : 0n;
+    return getAmountOutV3(BigInt(amountIn), px, liq, zeroForOne, feeUnits);
   }
   // PHASE 5 (audit): DODO PMM EXACT — nu mai returnăm 0. Quote off-chain
   // bit-exact cu DVMTrader.querySellBase/querySellQuote (vezi lib/dodo.js,
@@ -189,7 +219,19 @@ function findOpportunities(venues, tokens, opts = {}) {
               flashFee: best.flashFee, netProfit: best.net, profitInBnb,
               snapshot: snap ? { blockNumber: snap.blockNumber, blockHash: snap.blockHash, timestamp: snap.timestamp, stateVersion: snap.stateVersion } : null,
             };
-            if (isPlausible(opp)) ops.push(opp);
+            // TASK 4.6: isPlausible(>2%) NU MAI ELIMINĂ profiturile mari.
+            // Un profit "prea bun" este adesea REAL (pump/recent listing/lag de
+            // RPC) — trebuie VERIFICAT on-chain (staticCall în executor), nu
+            // aruncat. Keeper-ul trebuie să vadă și să judece, nu să piadă opri.
+            // Marcam opp-ul pentru verificare strictă și îl păstrăm în listă.
+            opp.needsVerification = !isPlausible(opp);
+            if (opp.needsVerification) {
+              logger.warn(
+                `[profit] large profit flagged for verification: ` +
+                `${opp.borrowToken?.symbol || "?"} net=${opp.netProfit?.toString?.() || opp.netProfit}`
+              );
+            }
+            ops.push(opp);
           }
         }
       }

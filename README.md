@@ -19,10 +19,11 @@ execută **flashloan-uri** (PancakeSwap V2 FlashSwap sau DODO) într-o singură 
 | DODO PMM math engine (JS) | PASS (Test A — parity JS vs EVM) |
 | DODO protocol mock flow | PASS (Test B — DODODVMMock) |
 | REAL DODO V2 fork flow | ✅ PASS (Test C — real pool, 70 USDT profit, 0.5% LP fee) |
-| V3 multi-tick quote engine | IMPLEMENTED |
-| Block snapshot consistency | IMPLEMENTED |
-| Nonce manager | IMPLEMENTED |
-| TX tracker + realized P&L | IMPLEMENTED |
+| V3 multi-tick quote engine (words + ticks + liquidityNet) | FORK VERIFIED (20/20 paritate vs QuoterV2, dev. 0 bps) |
+| Block snapshot consistency | FORK VERIFIED (validateSnapshot — reject la bloc inconsistent) |
+| Nonce manager (unul per proces/wallet, DI) | IMPLEMENTED |
+| TX tracker + realized P&L (submit → tracker → receipt → P&L) | IMPLEMENTED |
+| Large-profit verification (fără gate isPlausible >2%) | IMPLEMENTED (needsVerification → staticCall) |
 | Final requote + eth_call | IMPLEMENTED |
 | Size optimizer | PENDING |
 | Cost/economics engine (exact gas) | IMPLEMENTED |
@@ -31,6 +32,25 @@ execută **flashloan-uri** (PancakeSwap V2 FlashSwap sau DODO) într-o singură 
 | Paper execution | PENDING |
 | Micro-live | PENDING |
 | 24/7 production | PENDING |
+
+
+## Status TASK 4.3–4.6 (2026-05)
+
+- **4.3 Snapshot integration** — `takeSnapshot()` înainte de fiecare scanare; toate citirile
+  (`readState`) folosesc același `blockTag`; fiecare venue primește stampila `blockNumber`,
+  iar `validateSnapshot()` **reject-ează** orice oportunitate al cărei venue nu are exact
+  `snapshot.blockNumber` (nu se execută niciodată pe date inconsistente).
+- **4.4 V3 integration** — scannerul citește acum starea V3 profundă prin Multicall3:
+  `slot0` (sqrtPriceX96/tick/liquidity), `tickSpacing`, `tickBitmap` words în jurul
+  tick-ului curent și tick-urile inițializate cu `liquidityNet`; rezultatul alimentează
+  `lib/v3.getAmountOutV3Exact()`. Paritate verificată pe fork BSC vs `QuoterV2`
+  (`test/integration/v3-quoter-parity.js`): **20/20 cazuri, ambele direcții, deviație 0 bps**.
+- **4.5 Nonce + Tracker** — exact **un** `NonceManager` și **un** Tracker per proces/wallet
+  (injectați în `index.js`/`executor.js` — dependency injection). Flux: `submit` →
+  `tracker` → `receipt` → **realized P&L** (profit real din evenimente, nu estimare).
+- **4.6 isPlausible eliminat** — profiturile mari (>2%) **nu mai sunt eliminate** înainte de
+  Size Optimizer. Sunt marcate `needsVerification=true` și **verificate** prin
+  `eth_call` (staticCall) înainte de execuție; doar verificarea reală decide.
 
 ## Arhitectură
 
@@ -129,6 +149,7 @@ Vezi ghidul detaliat pas-cu-pas: **`TUTORIAL.md`**.
 | `npm run test:fork` | Test A — DODO PMM parity (JS vs EVM, necessită RPC cu arhivă) |
 | `npm run test:dodo-mock` | Test B — DODO protocol mock flow (DODODVMMock) |
 | `npm run test:dodo-fork` | Test C — REAL DODO V2 fork flow (✅ PASS — real pool, ~70 USDT profit) |
+| `npm run test:v3-parity` | TASK 4.4 — V3 quote local (words+ticks) vs QuoterV2 pe fork BSC (20/20, 0 bps) |
 | `npm run deploy` | Deploy pe BSC + scrie `CONTRACT_ADDRESS` în `.env` |
 | `npm run smoke` | Smoke test read-only pe rețeaua reală |
 | `npm run discover -- <router>` | Descoperă factory-ul + perechile unui DEX nou pe lanț |

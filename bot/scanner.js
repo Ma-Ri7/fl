@@ -1,6 +1,5 @@
 // FLASH — venue discovery + state reading for V2 / V3 / DODO.
 // All on-chain reads go through Multicall3 (aggregate3) in chunked batches.
-const { ethers } = require("ethers");
 const { MULTICALL3 } = require("./config");
 const cfg = require("./config");
 
@@ -180,6 +179,10 @@ const V2_PAIR_ABI = ["function getReserves() view returns (uint112 reserve0, uin
 const V3_POOL_ABI = [
   "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)",
   "function liquidity() view returns (uint128)",
+  // TASK 4.4: starea profunda pentru getAmountOutV3Exact() exact.
+  "function tickSpacing() view returns (int24)",
+  "function tickBitmap(int16) view returns (uint256)",
+  "function ticks(int24) view returns (uint128 liquidityGross,int128 liquidityNet,uint256 feeGrowthOutside0X128,uint256 feeGrowthOutside1X128,int56 tickCumulativeOutside,uint160 secondsPerLiquidityOutsideX128,uint32 secondsOutside,bool initialized)",
 ];
 const DODO_POOL_ABI = [
   "function _BASE_TOKEN_() view returns (address)",
@@ -279,3 +282,124 @@ async function readState(provider, venues, opts = {}) {
 
 module.exports = { multicall3, buildPairs, discoverVenues, readState, pairKey, chunk, sleep };
 
+
+// ══════════════ TASK 4.4: V3 deep state (tickSpacing, tickBitmap, ticks) ══════════════
+// Reads everything lib/v3.getAmountOutV3Exact() needs for EXACT off-chain quoting:
+//   slot0 (sqrtPriceX96, tick), liquidity, tickSpacing, tickBitmap words around
+//   the current word and every initialized tick's liquidityNet — all at one block.
+// (ABI-ul V3_POOL_ABI este cel declarat sus, extins cu tickSpacing/tickBitmap/ticks.)
+
+function isV3Venue(v) {
+  if (!v || typeof v !== "object") return false;
+  if (v.kind === 1 || v.isV3 === true || v.type === "V3" || v.venueType === "V3") return true;
+  const s = String(v.dex || v.name || v.protocol || "").toUpperCase();
+  return s.includes("V3");
+}
+
+/**
+ * TASK 4.4: deep V3 state (slot0 + tickSpacing + tickBitmap words +
+ * initialized ticks with liquidityNet) attached as v.v3State, consumed by
+ * lib/v3.getAmountOutV3Exact().
+ *
+ * Perf: per-call reads are impossible on dense pools (~1200 ticks x RPC
+ * latency, and hardhat's fork provider serializes them). ALL reads go through
+ * Multicall3 — enrichment collapses to ~3 eth_calls per pool.
+ */
+async function enrichV3Venues(provider, venues, opts = {}) {
+  const blockTag = opts.blockTag == null ? "latest" : opts.blockTag;
+  const W = opts.words == null ? 3 : opts.words;
+  const chunkSize = opts.chunkSize == null ? 200 : Number(opts.chunkSize);
+  const bn = blockTag === "latest" ? null : Number(blockTag);
+  const mcOpts = { chunkSize };
+  if (blockTag !== "latest") mcOpts.blockTag = blockTag;
+  const cod = ethers.AbiCoder.defaultAbiCoder();
+  const out = [];
+  for (const v of venues || []) {
+    if (!isV3Venue(v) || !v.pool) continue;
+    try {
+      // Phase 1 — head: slot0 + liquidity + tickSpacing (1 multicall batch).
+      const head = await multicall3(
+        provider,
+        [
+          { target: v.pool, fragment: V3_POOL_ABI[0] },
+          { target: v.pool, fragment: V3_POOL_ABI[1] },
+          { target: v.pool, fragment: V3_POOL_ABI[2] },
+        ],
+        mcOpts
+      );
+      if (!head[0].success || !head[1].success || !head[2].success) continue;
+      const s0 = cod.decode(
+        ["uint160", "int24", "uint16", "uint16", "uint16", "uint8", "bool"],
+        head[0].returnData
+      );
+      const liq = cod.decode(["uint128"], head[1].returnData)[0];
+      const spacing = Number(cod.decode(["int24"], head[2].returnData)[0]);
+      if (!spacing) continue;
+      const tick = Number(s0[1]);
+      const compressed = Math.floor(tick / spacing);
+      const wordPos = Math.floor(compressed / 256);
+      const wordPositions = [];
+      for (let w = wordPos - W; w <= wordPos + W; w++) wordPositions.push(w);
+
+      // Phase 2 — tickBitmap words around the current word (1 multicall batch).
+      const wordRes = await multicall3(
+        provider,
+        wordPositions.map((w) => ({ target: v.pool, fragment: V3_POOL_ABI[3], args: [w] })),
+        mcOpts
+      );
+      const words = [];
+      const tickPositions = [];
+      for (let i = 0; i < wordPositions.length; i++) {
+        const r = wordRes[i];
+        if (!r.success || r.returnData === "0x") continue;
+        const wordVal = BigInt(cod.decode(["uint256"], r.returnData)[0]);
+        if (wordVal === 0n) continue;
+        words.push({ word: wordPositions[i], value: wordVal.toString() });
+        for (let bit = 0; bit < 256; bit++) {
+          if (((wordVal >> BigInt(bit)) & 1n) === 0n) continue;
+          tickPositions.push((wordPositions[i] * 256 + bit) * spacing);
+        }
+      }
+
+      // Phase 3 — initialized ticks with liquidityNet (chunked multicall).
+      const tickRes = await multicall3(
+        provider,
+        tickPositions.map((t) => ({ target: v.pool, fragment: V3_POOL_ABI[4], args: [t] })),
+        mcOpts
+      );
+      const ticks = [];
+      for (let i = 0; i < tickPositions.length; i++) {
+        const r = tickRes[i];
+        if (!r.success || r.returnData === "0x") continue;
+        const d = cod.decode(
+          ["uint128", "int128", "uint256", "uint256", "int56", "uint160", "uint32", "bool"],
+          r.returnData
+        );
+        if (d[7]) {
+          ticks.push({
+            tick: tickPositions[i],
+            liquidityNet: d[1].toString(),
+            liquidityGross: d[0].toString(),
+          });
+        }
+      }
+      ticks.sort((a, b) => a.tick - b.tick);
+      v.v3State = {
+        address: v.pool,
+        sqrtPriceX96: s0[0].toString(),
+        tick,
+        liquidity: liq.toString(),
+        tickSpacing: spacing,
+        words,
+        ticks,
+        blockNumber: bn,
+      };
+      out.push(v);
+    } catch (e) {
+      // Best-effort lens: a failing pool keeps its plain slot0-based quote path.
+    }
+  }
+  return out;
+}
+
+Object.assign(module.exports, { isV3Venue, enrichV3Venues });

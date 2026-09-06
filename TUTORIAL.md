@@ -215,6 +215,14 @@ Testele unitare verifică:
 - arbitraj neprofitabil → tranzacția e respinsă (protecție on-chain);
 - doar owner-ul poate apela contractul / rescue.
 
+> **Teste de integrare (opționale, pe fork BSC — necesită `BSC_RPC_URL` în `.env`):**
+> ```bash
+> npm run test:v3-parity    # motorul V3 local (words+ticks) vs QuoterV2 — paritate 20/20, 0 bps
+> npm run test:dodo-fork    # flow REAL DODO V2 pe fork — flashloan + profit real
+> ```
+> Prima oară pot dura 1–2 minute (fork + Multicall3). Sunt dovada că matematica
+> off-chain a bot-ului (quote V3, DODO PMM) corespunde cu contractele reale on-chain.
+
 Exemplu ieșire așteptată:
 ```
 FlashLoanArbitrage (mock DEX)
