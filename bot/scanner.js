@@ -1,5 +1,6 @@
 // FLASH — venue discovery + state reading for V2 / V3 / DODO.
 // All on-chain reads go through Multicall3 (aggregate3) in chunked batches.
+const { ethers } = require("ethers");
 const { MULTICALL3 } = require("./config");
 const cfg = require("./config");
 

@@ -337,6 +337,14 @@ async function execGuardedOpp(opp, contractAddr, wallet, provider, opts = {}) {
     console.warn("[snapshot] REJECT: opp venues not on exact block " + Number(snap && snap.blockNumber));
     return null;
   }
+  // TASK 4.3-A: fresh on-chain state validation — citește starea REALĂ pe lanț
+  // la freshBlockNumber și compară amprentele. Dacă diferă => REJECT (stale-state).
+  const { freshOnChainStateValidation } = require("./fresh");
+  const freshResult = await freshOnChainStateValidation(opp, provider);
+  if (!freshResult.ok) {
+    console.warn("[fresh] REJECT: " + freshResult.reason);
+    return { ok: false, reason: freshResult.reason, details: freshResult.details };
+  }
   return executeOpp(opp, contractAddr, wallet, provider, opts);
 }
 module.exports = { main, takeSnapshot };

@@ -99,13 +99,80 @@ describe("TASK 4.2-A — snapshot guard + integration", function () {
       const index = require("../../bot/index");
 
       try {
+        // TASK 4.3-A: execGuardedOpp now runs freshOnChainStateValidation before
+        // executeOpp. The mock provider must therefore handle getBlock() + the
+        // Multicall3 aggregate3 call, and the opp must carry complete venues
+        // with stateFingerprint so the fresh gate passes.
+        const { ethers } = require("ethers");
+        const { MULTICALL3 } = require("../../bot/config");
+        const snapMod = require("../../bot/snapshot");
+
+        const PAIR_A = "0x" + "a1".repeat(20);
+        const PAIR_B = "0x" + "a2".repeat(20);
+        const TOKEN_A = "0x" + "b1".repeat(20);
+        const TOKEN_B = "0x" + "b2".repeat(20);
+
+        const buyVen = {
+          kind: "v2", pair: PAIR_A, router: "0xRouterA",
+          tokenA: { address: TOKEN_A, decimals: 18 },
+          tokenB: { address: TOKEN_B, decimals: 18 },
+          reserveA: 1000000n, reserveB: 2000000n, feeBps: 25,
+          blockNumber: 100,
+        };
+        const sellVen = {
+          kind: "v2", pair: PAIR_B, router: "0xRouterB",
+          tokenA: { address: TOKEN_A, decimals: 18 },
+          tokenB: { address: TOKEN_B, decimals: 18 },
+          reserveA: 1500000n, reserveB: 2500000n, feeBps: 25,
+          blockNumber: 100,
+        };
+
+        const stateFingerprint = snapMod.opportunityFingerprints([buyVen, sellVen]);
+
+        const opp = {
+          buyVen, sellVen,
+          borrowAmount: 1000n, netProfit: 5n,
+          snapshot: { blockNumber: 100, blockHash: HASH100, stateVersion: 0n },
+          stateFingerprint,
+        };
+
+        // Mock provider: getBlock() + Multicall3 aggregate3 handler that returns
+        // the SAME reserves (fresh state == snapshot state => ACCEPT).
+        const cod = ethers.AbiCoder.defaultAbiCoder();
+        const mc3Iface = new ethers.Interface([
+          "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) view returns (tuple(bool success, bytes returnData)[] returnData)",
+        ]);
+        const SEL_getReserves = ethers.id("getReserves()").slice(0, 10);
+        const reservesByPair = {
+          [PAIR_A.toLowerCase()]: [1000000n, 2000000n],
+          [PAIR_B.toLowerCase()]: [1500000n, 2500000n],
+        };
+        const provider = {
+          getBlockNumber: async () => 100,
+          getBlock: async () => ({ hash: HASH100, timestamp: 1700000000 }),
+          async call(tx) {
+            const [calls] = mc3Iface.decodeFunctionData("aggregate3", tx.data);
+            const results = [];
+            for (const c of calls) {
+              const target = c.target.toLowerCase();
+              const selector = c.callData.slice(0, 10);
+              if (selector === SEL_getReserves && reservesByPair[target]) {
+                const [r0, r1] = reservesByPair[target];
+                results.push([true, cod.encode(["uint112", "uint112", "uint32"], [r0, r1, 0])]);
+              } else {
+                results.push([false, "0x"]);
+              }
+            }
+            return mc3Iface.encodeFunctionResult("aggregate3", [results]);
+          },
+        };
+
         const wallet = { getAddress: async () => "0xWallet" };
-        const provider = { getBlockNumber: async () => 100 };
         const nonceManager = { reserve: async () => 5 };
         const snapshot = makeSnapshot(100);
 
         const result = await index.execGuardedOpp(
-          makeOpp(100, 100),
+          opp,
           "0xContract",
           wallet,
           provider,
