@@ -4,6 +4,7 @@ const { getAmountOut, getAmountOutV3, v3Depth } = require("../lib/amm");
 const { getAmountOutV3Exact } = require("../lib/v3"); // TASK 4.4: quote EXACT
 const dodo = require("../lib/dodo");
 const { pairKey } = require("./scanner");
+const snapshotMod = require("./snapshot"); // TASK 4.3: state fingerprints
 const config = require("./config");
 
 const FLASH_FEE_V2_BPS = 25; // PancakeSwap V2 flashswap = 0.25%
@@ -218,6 +219,9 @@ function findOpportunities(venues, tokens, opts = {}) {
               borrowAmount: best.borrow, baseRecv: best.baseRecv, quoteRecv: best.quoteRecv,
               flashFee: best.flashFee, netProfit: best.net, profitInBnb,
               snapshot: snap ? { blockNumber: snap.blockNumber, blockHash: snap.blockHash, timestamp: snap.timestamp, stateVersion: snap.stateVersion } : null,
+              // TASK 4.3: amprentele de state la momentul construirii —
+              // executorul le compară cu starea curentă la validare (TOCTOU).
+              stateFingerprint: snap ? snapshotMod.opportunityFingerprints([buyVen, sellVen]) : null,
             };
             // TASK 4.6: isPlausible(>2%) NU MAI ELIMINĂ profiturile mari.
             // Un profit "prea bun" este adesea REAL (pump/recent listing/lag de

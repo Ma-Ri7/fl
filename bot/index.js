@@ -19,15 +19,15 @@ const BACKOFF_MS = 30_000;
 function fmtTok(r, d) { return Number(ethers.formatUnits(r, d)).toFixed(4); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function takeSnapshot(provider) {
-  const block = await provider.getBlock("latest");
-  return {
-    blockNumber: block.number,
-    blockHash: block.hash,
-    timestamp: BigInt(block.timestamp),
-    stateVersion: 0n,
-  };
-}
+// TASK 4.3: single snapshot source of truth (bot/snapshot.js) — blockNumber,
+// blockHash, timestamp și stateVersion (contor care crește per snapshot).
+const {
+  createSnapshot,
+  attachVenueFingerprints,
+  venueKey,
+  venueFingerprint,
+} = require("./snapshot");
+const takeSnapshot = createSnapshot; // backward-compatible alias
 
 async function refreshVenues(provider, pairs) {
   const { venues } = await discoverVenues(provider, config);
@@ -117,6 +117,9 @@ async function main(deps = {}) {
       for (const v of venues) v.blockNumber = Number(snapshot.blockNumber);
       // TASK 4.4: deep-read V3 pools (slot0/tickSpacing/tickBitmap/ticks) on the SAME block.
       await enrichV3Venues(provider, venues, { blockTag: snapshot.blockNumber });
+      // TASK 4.3: STATE FINGERPRINT — amprenta canonică a stării care afectează
+      // quote-ul, per venue, la block-ul snapshot-ului (validatorul o compară).
+      attachVenueFingerprints(snapshot, venues);
 
       // Find opportunities - tokens=null defaults to config.TOKENS
       const opps = findOpportunities(venues, null, { snapshot });
@@ -265,9 +268,25 @@ function collectOppVenues(opp) {
 }
 
 function validateSnapshot(opp, snapshot) {
+  // (A) Snapshot-ul curent trebuie să existe.
   if (!snapshot || snapshot.blockNumber == null) return false;
   if (!opp || typeof opp !== "object") return false;
   const want = Number(snapshot.blockNumber);
+
+  // (B) Oportunitatea trebuie să transporte identitatea snapshot-ului din care
+  // a fost calculată — și să fie ACELAȘI block cu snapshot-ul curent.
+  if (!opp.snapshot || opp.snapshot.blockNumber == null) return false;
+  if (Number(opp.snapshot.blockNumber) !== want) return false;
+
+  // (C) blockHash — verificare explicită, niciodată "implicit valid".
+  // Dacă snapshot-ul curent are hash dar oportunitatea nu îl transportă,
+  // identitatea NU poate fi demonstrată => REJECT.
+  if (snapshot.blockHash != null) {
+    if (opp.snapshot.blockHash == null) return false;
+    if (String(snapshot.blockHash).toLowerCase() !== String(opp.snapshot.blockHash).toLowerCase()) {
+      return false; // (Test 10) alt hash la același blockNumber
+    }
+  }
 
   // Primary structure (profit.js): buyVen + sellVen. If the opp carries either,
   // BOTH are required (Tests D/E: missing venue => REJECT) and both must sit
@@ -282,6 +301,27 @@ function validateSnapshot(opp, snapshot) {
   // Additional legacy venues (if any) must also be on the snapshot block.
   const extras = collectOppVenues(opp).filter((v) => v !== opp.buyVen && v !== opp.sellVen);
   if (extras.length && !extras.every((v) => Number(v.blockNumber) === want)) return false;
+
+  // (D) TASK 4.3 — STATE FINGERPRINT: same blockNumber NU înseamnă same state.
+  // Când snapshot-ul poartă amprente de venue (fingerprinting activ), fiecare
+  // venue folosit de oportunitate trebuie să aibă:
+  //   1. intrare în snapshot.venues (state-ul citit la acel block),
+  //   2. amprentă pe oportunitate (calculată la construire — Test 11: lipsă => REJECT),
+  //   3. amprenta CURENTĂ (recalculată acum din obiectul venue) identică,
+  //   4. amprenta din snapshot identică cu celelalte.
+  // Orice diferență => oportunitatea e STALE => REJECT (fără re-quote automat).
+  if (snapshot.venues && typeof snapshot.venues === "object") {
+    for (const v of [opp.buyVen, opp.sellVen]) {
+      if (!v || typeof v !== "object") continue;
+      const key = venueKey(v);
+      const snapEntry = snapshot.venues[key];
+      const oppFp = opp.stateFingerprint ? opp.stateFingerprint[key] : undefined;
+      const currentFp = venueFingerprint(v);
+      if (!snapEntry || !oppFp || !currentFp) return false; // neverificabil => REJECT
+      if (oppFp !== currentFp) return false;                 // state-ul s-a schimbat (TOCTOU)
+      if (snapEntry.fingerprint !== oppFp) return false;     // snapshot ≠ opp (inconsistent)
+    }
+  }
 
   // Nothing verifiable => REJECT (never execute unverifiable opportunities).
   return hasPrimary || collectOppVenues(opp).length > 0;

@@ -22,12 +22,15 @@ const {
 
 describe("TASK 4.2-A — snapshot guard + integration", function () {
   // A realistic opportunity object as profit.js builds it (buyVen/sellVen).
+  // TASK 4.3: opp must also carry the snapshot identity it was built from.
+  const HASH100 = "0x" + "0".repeat(64);
   function makeOpp(bnBuy = 100, bnSell = 100) {
     return {
       buyVen: { kind: "v2", router: "0xRouterA", blockNumber: bnBuy },
       sellVen: { kind: "v2", router: "0xRouterB", blockNumber: bnSell },
       borrowAmount: 1000n,
       netProfit: 5n,
+      snapshot: { blockNumber: 100, blockHash: HASH100, stateVersion: 0n },
     };
   }
 
@@ -132,7 +135,7 @@ describe("TASK 4.2-A — snapshot guard + integration", function () {
     const TX_HASH = "0x" + "ab".repeat(32);
     const E18 = 10n ** 18n;
 
-    function makeOpp() {
+    function makeDiOpp() {
       const tokWbnb = { address: WBNB, decimals: 18, symbol: "WBNB" };
       const tokBase = { address: BASE, decimals: 18, symbol: "BASE" };
       return {
@@ -218,7 +221,7 @@ describe("TASK 4.2-A — snapshot guard + integration", function () {
         };
 
         const result = await executor.executeOpp(
-          makeOpp(), CONTRACT, makeWallet(sent), makeProvider(),
+          makeDiOpp(), CONTRACT, makeWallet(sent), makeProvider(),
           { nonceManager: injectedManager }
         );
 
@@ -237,7 +240,7 @@ describe("TASK 4.2-A — snapshot guard + integration", function () {
       await withStubbedDeps(async (executor, spy) => {
         const sent = [];
         const result = await executor.executeOpp(
-          makeOpp(), CONTRACT, makeWallet(sent), makeProvider(), {}
+          makeDiOpp(), CONTRACT, makeWallet(sent), makeProvider(), {}
         );
         expect(result.ok).to.equal(true);
         expect(spy.constructed).to.equal(1);          // fallback constructed exactly once
@@ -252,7 +255,7 @@ describe("TASK 4.2-A — snapshot guard + integration", function () {
         const broken = { reserve: async () => 7 };    // missing commit/rollback
         let err = null;
         try {
-          await executor.executeOpp(makeOpp(), CONTRACT, makeWallet([]), makeProvider(), { nonceManager: broken });
+          await executor.executeOpp(makeDiOpp(), CONTRACT, makeWallet([]), makeProvider(), { nonceManager: broken });
         } catch (e) { err = e; }
         expect(err).to.not.equal(null);
         expect(err.message).to.include("invalid-nonce-manager");
