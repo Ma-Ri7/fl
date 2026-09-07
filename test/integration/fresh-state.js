@@ -338,12 +338,28 @@ describe("TASK 4.3-A — fresh on-chain state validation", function () {
       const ven = v3Venue();
       const opp = buildOpp(ven, null);
       const provider = new MockProvider(101, HASH);
+      // Use a DIFFERENT bitmap (bit 166 instead of bit 167) => tick -900 instead of -890.
+      const freshBitmap = 1n << 166n;
       registerV3State(provider, ven, {
         sqrtPriceX96: 79228162514264337593543950336n,
         tick: -887, liquidity: 500000000000000000n, tickSpacing: 10,
-        bitmapWordValue: 170141183460469231731687303715884105728n,
+        bitmapWordValue: freshBitmap,
         liquidityNet: 100000000000000000n, liquidityGross: 100000000000000000n,
       });
+
+      // Explicitly demonstrate the fresh bitmap differs from the snapshot bitmap.
+      const snapshotBitmap = 1n << 167n;
+      expect(freshBitmap).to.not.equal(snapshotBitmap);
+
+      // Read fresh state and verify the initialized tick position reflects the new bitmap.
+      const freshVenue = await freshMod.readFreshVenueState(provider, ven, 101);
+      expect(freshVenue).to.not.equal(null);
+      // Snapshot tick is -890 (from bit 167); fresh tick must be -900 (from bit 166).
+      expect(freshVenue.v3State.ticks.length).to.equal(1);
+      expect(freshVenue.v3State.ticks[0].tick).to.equal(-900);
+      expect(ven.v3State.ticks[0].tick).to.equal(-890);
+      expect(freshVenue.v3State.ticks[0].tick).to.not.equal(ven.v3State.ticks[0].tick);
+
       const result = await freshMod.freshOnChainStateValidation(opp, provider);
       expect(result.ok).to.equal(false);
       expect(result.reason).to.equal("stale-state");
