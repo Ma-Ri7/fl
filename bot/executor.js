@@ -62,26 +62,43 @@ function buildCalldata(opp) {
     };
   }
 
-  // V2 flashswap: legs must use ROUTERS (not pair addresses)
+  // V2 flashswap: legs are Leg tuples (kind/target/zeroForOne/path) — aceeași
+  // structură ca la DODO (buildLeg). Semnătura reală a contractului:
+  //   flashArbitrage(pair, amount0, amount1, legA, legB, minProfit, deadline)
+  // BUG fix (descoperit de Testul G1 comportamental): encoding-ul vechi trimitea
+  // router+path ca argumente plate (9 args vs 7) → toate oportunitățile V2
+  // aruncau "too many arguments" la buildCalldata, înainte de orice submisie.
   const bIsT0 = opp.borrowToken.address.toLowerCase() === opp.sourceVen.tokenA?.address?.toLowerCase();
   const amount0Out = bIsT0 ? opp.borrowAmount : 0n;
   const amount1Out = bIsT0 ? 0n : opp.borrowAmount;
-  const pathA = [opp.borrowToken.address, opp.baseToken.address];
-  const pathB = [opp.baseToken.address, opp.borrowToken.address];
+  const legA = buildLeg(opp.buyVen, opp.borrowToken.address);
+  const legB = buildLeg(opp.sellVen, opp.baseToken.address);
   return {
     sig: "v2",
     data: iface.encodeFunctionData("flashArbitrage", [
       opp.sourceVen.pair, amount0Out, amount1Out,
-      opp.buyVen.router, pathA, opp.sellVen.router, pathB,
-      minProfit, deadline,
+      legA, legB, minProfit, deadline,
     ]),
   };
 }
 
 function parseCalldata(fn, data) {
   const decoded = iface.decodeFunctionData(fn, data);
-  // Convert ethers Result (with named struct fields) to a plain array
-  return decoded.toArray ? decoded.toArray() : Array.from(decoded);
+  // Convert ethers Result (with named struct fields) to a plain array.
+  // BUG fix: staticCall re-encodes the args — passing read-only Result
+  // proxies (nested leg tuples) back into ethers throws
+  // "Cannot assign to read only property '0'". Deep-plain conversion
+  // păstrează BigInt-urile și produce array-uri/obiecte mutabile.
+  const toPlain = (v) => {
+    if (Array.isArray(v)) return Array.from(v, toPlain);
+    if (v && typeof v === "object") {
+      const out = {};
+      for (const k of Object.keys(v)) out[k] = toPlain(v[k]);
+      return out;
+    }
+    return v;
+  };
+  return toPlain(decoded.toArray ? decoded.toArray() : Array.from(decoded));
 }
 
 async function simulate(contractAddr, calldata, sig, provider) {
@@ -205,11 +222,30 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
   }
 
   // ---- 6. NONCE RESERVATION (PHASE 11) --------------------------------------
-  // TASK 4.2-A (Test G): never construct a second manager when a valid one is
-  // injected — double managers would double-reserve nonces for the same wallet.
-  const nonceMgr = opts.nonceManager instanceof NonceManager
-    ? opts.nonceManager
-    : new NonceManager(wallet, config.bot.maxNonceGap);
+  // TASK 4.2-B — contractul de dependency injection:
+  //   opts.nonceManager PREZENT  => se folosește EXACT obiectul injectat (chiar
+  //   dacă e mock/din altă implementare); NU se construiește un al doilea
+  //   manager (risc de double-reserve pe același wallet).
+  //   opts.nonceManager ABSENT   => fallback: NonceManager real.
+  // Validare structurală (NU instanceof ca mecanism principal): obiectul
+  // injectat trebuie să expose reserve/commit/rollback; altfel eroare
+  // explicită — niciodată fallback tăcut care ar ascunde un bug de DI.
+  let nonceMgr;
+  if (opts.nonceManager != null) {
+    const m = opts.nonceManager;
+    const structural =
+      typeof m.reserve === "function" &&
+      typeof m.commit === "function" &&
+      typeof m.rollback === "function";
+    if (!structural) {
+      throw new Error(
+        "invalid-nonce-manager: opts.nonceManager must expose reserve/commit/rollback"
+      );
+    }
+    nonceMgr = m;
+  } else {
+    nonceMgr = new NonceManager(wallet, config.bot.maxNonceGap);
+  }
   const nonce = await nonceMgr.reserve();
   if (nonce === null) {
     return { ok: false, reason: "nonce-saturation" };
