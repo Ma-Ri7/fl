@@ -254,6 +254,8 @@ async function main(deps = {}) {
 // block. Mixed/stale snapshots are REJECTED (logged, never executed).
 function collectOppVenues(opp) {
   const cands = [];
+  if (opp && opp.buyVen && typeof opp.buyVen === "object") cands.push(opp.buyVen);
+  if (opp && opp.sellVen && typeof opp.sellVen === "object") cands.push(opp.sellVen);
   if (opp && Array.isArray(opp.venues)) cands.push(...opp.venues);
   if (opp && Array.isArray(opp.legs)) cands.push(...opp.legs);
   for (const k of ["legA", "legB", "buy", "sell", "venueIn", "venueOut"]) {
@@ -264,21 +266,38 @@ function collectOppVenues(opp) {
 
 function validateSnapshot(opp, snapshot) {
   if (!snapshot || snapshot.blockNumber == null) return false;
-  const vs = collectOppVenues(opp);
-  if (!vs.length) return false; // nothing verifiable -> reject
+  if (!opp || typeof opp !== "object") return false;
   const want = Number(snapshot.blockNumber);
-  return vs.every((v) => Number(v.blockNumber) === want);
+
+  // Primary structure (profit.js): buyVen + sellVen. If the opp carries either,
+  // BOTH are required (Tests D/E: missing venue => REJECT) and both must sit
+  // on the exact snapshot block (Tests B/C: stale venue => REJECT).
+  const hasPrimary = opp.buyVen != null || opp.sellVen != null;
+  if (hasPrimary) {
+    if (!opp.buyVen || !opp.sellVen) return false;
+    if (Number(opp.buyVen.blockNumber) !== want) return false;
+    if (Number(opp.sellVen.blockNumber) !== want) return false;
+  }
+
+  // Additional legacy venues (if any) must also be on the snapshot block.
+  const extras = collectOppVenues(opp).filter((v) => v !== opp.buyVen && v !== opp.sellVen);
+  if (extras.length && !extras.every((v) => Number(v.blockNumber) === want)) return false;
+
+  // Nothing verifiable => REJECT (never execute unverifiable opportunities).
+  return hasPrimary || collectOppVenues(opp).length > 0;
 }
 
 // Execution wrapper: rejects opportunities whose venues are not all on the
 // exact snapshot block, then delegates to the real executor.
-async function execGuardedOpp(opp, cfg, opts = {}) {
+// TASK 4.2-A: signature is (opp, contractAddr, wallet, provider, opts) so that
+// every dependency reaches executeOpp() — JS silently drops extras otherwise.
+async function execGuardedOpp(opp, contractAddr, wallet, provider, opts = {}) {
   const snap = (opts && opts.snapshot) || lastSnapshot;
   if (!validateSnapshot(opp, snap)) {
     console.warn("[snapshot] REJECT: opp venues not on exact block " + Number(snap && snap.blockNumber));
     return null;
   }
-  return executeOpp(opp, cfg, opts);
+  return executeOpp(opp, contractAddr, wallet, provider, opts);
 }
 module.exports = { main, takeSnapshot };
 

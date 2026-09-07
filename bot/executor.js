@@ -205,7 +205,11 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
   }
 
   // ---- 6. NONCE RESERVATION (PHASE 11) --------------------------------------
-  const nonceMgr = opts.nonceManager || new NonceManager(wallet, config.bot.maxNonceGap);
+  // TASK 4.2-A (Test G): never construct a second manager when a valid one is
+  // injected — double managers would double-reserve nonces for the same wallet.
+  const nonceMgr = opts.nonceManager instanceof NonceManager
+    ? opts.nonceManager
+    : new NonceManager(wallet, config.bot.maxNonceGap);
   const nonce = await nonceMgr.reserve();
   if (nonce === null) {
     return { ok: false, reason: "nonce-saturation" };
