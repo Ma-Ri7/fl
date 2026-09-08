@@ -269,20 +269,27 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
       nonce,
     });
     if (result.ok && result.status === "accepted") {
+      // Private submission ACCEPTED — txHash exists. Commit MUST succeed.
+      // FAIL-CLOSED: if commit throws, nonce is blocked forever (never rolled back).
       try {
         nonceMgr.commit(nonce, result.txHash);
       } catch (e) {
-        logger.error(`[executor] commit failed (nonce=${nonce}): ${e.message}`);
+        logger.error(`[executor] nonce commit failed (private, nonce=${nonce}, txHash=${result.txHash}): ${e.message}`);
+        // INVARIANT: txHash exists + commit failure = nonce must remain blocked.
+        // NEVER rollback. Return explicit failure.
+        return { ok: false, reason: "nonce-commit-failed", nonce, txHash: result.txHash, private: true, err: e.message };
       }
       return { ok: true, txHash: result.txHash, blockNumber: result.block, profit: fq.net, minProfit: fq.minProfit, private: true, nonce };
     }
     if (result.status === "unknown") {
-      // CRITICAL: nu cunoaștem starea — nicio a doua submisie cu acest nonce.
-      // NonceManager păstrează un tombstone până la reap.
+      // Private submission UNKNOWN — no txHash, but nonce may still be used.
+      // commit(nonce, null) marks a tombstone. If it throws, nonce is blocked.
       try {
         nonceMgr.commit(nonce, null);
       } catch (e) {
-        logger.error(`[executor] commit-tombstone failed (nonce=${nonce}): ${e.message}`);
+        logger.error(`[executor] nonce commit-tombstone failed (private, nonce=${nonce}): ${e.message}`);
+        // FAIL-CLOSED: commit failure = nonce blocked, never rolled back.
+        return { ok: false, reason: "nonce-commit-failed", nonce, txHash: null, private: true, err: e.message };
       }
       logger.warn(`[executor] private submission UNKNOWN (nonce=${nonce}) — NU se face fallback public`);
       return { ok: false, reason: "private-unknown", err: result.error, nonce, txHash: result.txHash || null };
@@ -299,18 +306,22 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
       gasPrice,
       nonce,
     });
+    // Public broadcast succeeded — txHash exists. Commit MUST succeed.
+    // FAIL-CLOSED: if commit throws, nonce is blocked forever (never rolled back).
     try {
       nonceMgr.commit(nonce, tx.hash);
     } catch (e) {
-      logger.error(`[executor] commit failed (nonce=${nonce}): ${e.message}`);
+      logger.error(`[executor] nonce commit failed (public, nonce=${nonce}, txHash=${tx.hash}): ${e.message}`);
+      // INVARIANT: txHash exists + commit failure = nonce must remain blocked.
+      // NEVER rollback. Return explicit failure.
+      return { ok: false, reason: "nonce-commit-failed", nonce, txHash: tx.hash, private: false, err: e.message };
     }
     return { ok: true, txHash: tx.hash, profit: fq.net, minProfit: fq.minProfit, private: false, nonce };
   } catch (e) {
+    // Broadcast failure BEFORE txHash exists — rollback is safe.
     try {
       nonceMgr.rollback(nonce);
     } catch (rbErr) {
-      // rollback can fail if nonce was already committed (tx hash exists) or
-      // already rolled back — log but don't mask the original error.
       logger.error(`[executor] rollback failed (nonce=${nonce}): ${rbErr.message}`);
     }
     return { ok: false, reason: "broadcast-fail", err: e.message.slice(0, 120), nonce };

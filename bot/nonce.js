@@ -13,6 +13,7 @@ class NonceManager {
     this.next = null;          // următorul nonce liber (local)
     this.pending = new Map();  // nonce -> { hash, ts }  (COMMITTED)
     this.reserved = new Set(); // nonce currently RESERVED (not yet committed/rolled back)
+    this.blocked = new Set();  // nonce known on-chain but commit failed — NEVER reusable
     this.lastSync = 0;
 
     // Mutex for atomic reserve(): chains promises so concurrent callers
@@ -41,6 +42,8 @@ class NonceManager {
     const result = this._reserveChain.then(async () => {
       if (this.next === null) await this.init();
       if (this.pending.size + this.reserved.size >= this.maxPending) return null;
+      // Skip blocked nonces (known on-chain, commit failed — NEVER reusable).
+      while (this.blocked.has(this.next)) this.next += 1;
       const nonce = this.next;
       this.next += 1;
       this.reserved.add(nonce); // mark RESERVED
@@ -55,6 +58,9 @@ class NonceManager {
    * Tranzacția a fost transmisă cu acest nonce — trece din RESERVED în COMMITTED.
    *  hash poate fi null (submisie privată UNKNOWN — tombstone până la reap).
    *
+   * FAIL-CLOSED: if this throws, the nonce is moved to `blocked` (known to be
+   * used on-chain but commit could not be recorded). It can NEVER be reused.
+   *
    * THROWS if:
    *   - nonce was not reserved by this manager (nonce-not-reserved)
    *   - nonce is already committed (nonce-already-committed)
@@ -63,8 +69,11 @@ class NonceManager {
     const n = Number(nonce);
     if (!this.reserved.has(n)) {
       if (this.pending.has(n)) {
+        // Move to blocked before throwing — nonce must never be reused.
+        this.blocked.add(n);
         throw new Error(`nonce-already-committed: nonce ${n} is already committed`);
       }
+      this.blocked.add(n);
       throw new Error(`nonce-not-reserved: nonce ${n} was not reserved by this manager`);
     }
     this.reserved.delete(n);
