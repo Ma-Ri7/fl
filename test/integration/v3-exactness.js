@@ -55,6 +55,13 @@ function completeBitmap() {
   return m;
 }
 
+// NOTE: the current tick (`tick`) is NOT added to the bitmap. In a real pool the
+// current tick is always "initialized" in the bitmap, but its liquidityNet is
+// NOT applied when crossing FROM it — the engine starts AT this tick and looks
+// for the NEXT initialized tick. Adding the start tick to the bitmap without a
+// matching ticks-map entry would create the exact "bitmap=1 + tick data MISSING"
+// UNKNOWN state that TASK 4.4-B-FIX guards against (missing-initialized-tick).
+// So we only mark the ticks that will actually be crossed.
 function buildTicksUp(n, tick) {
   const ticks = new Map();
   const bits = [];
@@ -65,8 +72,6 @@ function buildTicksUp(n, tick) {
     bits.push({ wordPos, bitPos });
   }
   const wordsMap = completeBitmap();
-  const startBit = v3lib.position(tick, SPACING);
-  bits.push(startBit);
   for (const { wordPos, bitPos } of bits) {
     wordsMap.set(wordPos, (wordsMap.get(wordPos) || 0n) | (1n << BigInt(bitPos)));
   }
@@ -83,8 +88,6 @@ function buildTicksDown(n, tick) {
     bits.push({ wordPos, bitPos });
   }
   const wordsMap = completeBitmap();
-  const startBit = v3lib.position(tick, SPACING);
-  bits.push(startBit);
   for (const { wordPos, bitPos } of bits) {
     wordsMap.set(wordPos, (wordsMap.get(wordPos) || 0n) | (1n << BigInt(bitPos)));
   }
@@ -1194,6 +1197,418 @@ describe("TASK 4.4-B - V3 state coverage & boundary proof", function () {
         // quote from the insufficient venue.
         expectGt(BigInt(o.netProfit), 0n);
       }
+    });
+  });
+});
+
+// ============================================================================
+// TASK 4.4-B-FIX — V3 initialized-tick completeness & UNKNOWN state.
+//
+// The exact engine must distinguish THREE states (not two):
+//
+//   BITMAP word absent               -> UNKNOWN  -> missing-tickbitmap-word
+//   BITMAP word present, value 0n    -> EMPTY    -> valid (genuinely no ticks)
+//   BITMAP bit = 1 + tick data KNOWN -> INITIALIZED -> valid (cross with liquidityNet)
+//   BITMAP bit = 1 + tick data MISSING -> UNKNOWN -> missing-initialized-tick
+//
+// The last case is the fail-open that TASK 4.4-B-FIX closes: a tick that the
+// bitmap says is initialized, but whose liquidityNet was never read (RPC failure,
+// truncated response, etc.) must NOT be silently treated as non-initialized.
+// ============================================================================
+describe("TASK 4.4-B-FIX - V3 initialized-tick completeness & UNKNOWN state", function () {
+
+  // Helper: build a fixture where the bitmap says `initializedTick` is
+  // initialized, but the ticks Map either has or lacks the liquidityNet entry.
+  function fixtureWithInitializedTick(startTick, initializedTick, includeTickData) {
+    const { wordPos, bitPos } = v3lib.position(initializedTick, SPACING);
+    const words = new Map();
+    for (let w = WORD_LO; w <= WORD_HI; w++) words.set(w, 0n); // complete bitmap
+    words.set(wordPos, words.get(wordPos) | (1n << BigInt(bitPos)));
+    const ticks = new Map();
+    if (includeTickData) ticks.set(initializedTick, 0n);
+    return { words, ticks, wordPos, bitPos };
+  }
+
+  function expectMissingTick(fn) {
+    let msg = null;
+    try { fn(); } catch (e) { msg = e.message; }
+    expect(msg, "expected fail closed on missing initialized tick")
+      .to.equal("missing-initialized-tick");
+  }
+
+  // ---- §5/§6 Missing initialized tick, both directions ---------------------
+  // NOTE: start tick and initialized tick MUST be in the same bitmap word,
+  // otherwise the traversal breaks (consumed=0) before reaching the tick.
+  // Word 0 holds ticks 0..2550 (SPACING=10): use +10 start / 0 initialized
+  // for zeroForOne=true (traverses down), and 0 start / +10 initialized for
+  // zeroForOne=false (traverses up).
+  describe("missing initialized tick -> fail closed (both directions)", function () {
+    it("zeroForOne=true: throws missing-initialized-tick when tick data absent", function () {
+      const { words, ticks } = fixtureWithInitializedTick(10, 0, false);
+      expectMissingTick(() => v3lib.getAmountOutV3Exact({
+        amountIn: 10n ** 18n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+        words, ticks,
+        sqrtPx96: v3lib.getSqrtRatioAtTick(10), liquidity: LIQUIDITY, tick: 10,
+      }));
+    });
+
+    it("zeroForOne=false: throws missing-initialized-tick when tick data absent", function () {
+      const { words, ticks } = fixtureWithInitializedTick(0, 10, false);
+      expectMissingTick(() => v3lib.getAmountOutV3Exact({
+        amountIn: 10n ** 18n, zeroForOne: false, fee: FEE, tickSpacing: SPACING,
+        words, ticks,
+        sqrtPx96: v3lib.getSqrtRatioAtTick(0), liquidity: LIQUIDITY, tick: 0,
+      }));
+    });
+
+    it("error is exactly missing-initialized-tick (not missing-tickbitmap-word)", function () {
+      const { words, ticks } = fixtureWithInitializedTick(10, 0, false);
+      let msg = null;
+      try {
+        v3lib.getAmountOutV3Exact({
+          amountIn: 10n ** 18n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+          words, ticks,
+          sqrtPx96: v3lib.getSqrtRatioAtTick(10), liquidity: LIQUIDITY, tick: 10,
+        });
+      } catch (e) { msg = e.message; }
+      expect(msg).to.equal("missing-initialized-tick");
+      expect(msg).to.not.equal("missing-tickbitmap-word");
+    });
+  });
+
+  // ---- §7 Known initialized tick continues normally -----------------------
+  describe("known initialized tick (bitmap=1 + tick data exists) -> valid", function () {
+    it("crosses normally when tick data present (zeroForOne=true)", function () {
+      const { words, ticks } = fixtureWithInitializedTick(10, 0, true);
+      let threw = null; let r = null;
+      try {
+        r = v3lib.getAmountOutV3Exact({
+          amountIn: 10n ** 18n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+          words, ticks,
+          sqrtPx96: v3lib.getSqrtRatioAtTick(10), liquidity: LIQUIDITY, tick: 10,
+        });
+      } catch (e) { threw = e.message; }
+      expect(threw, "must not throw when tick data present").to.equal(null);
+      expectGt(r.amountOut, 0n);
+      expect(r.crossed).to.be.gte(1);
+    });
+
+    it("crosses normally when tick data present (zeroForOne=false)", function () {
+      const { words, ticks } = fixtureWithInitializedTick(0, 10, true);
+      let threw = null; let r = null;
+      try {
+        r = v3lib.getAmountOutV3Exact({
+          amountIn: 10n ** 18n, zeroForOne: false, fee: FEE, tickSpacing: SPACING,
+          words, ticks,
+          sqrtPx96: v3lib.getSqrtRatioAtTick(0), liquidity: LIQUIDITY, tick: 0,
+        });
+      } catch (e) { threw = e.message; }
+      expect(threw, "must not throw when tick data present").to.equal(null);
+      expectGt(r.amountOut, 0n);
+      expect(r.crossed).to.be.gte(1);
+    });
+  });
+
+  // ---- §8 Explicit empty word stays valid ----------------------------------
+  describe("explicit EMPTY word (0n) stays valid", function () {
+    it("does NOT throw for a word set to 0n (zeroForOne=true)", function () {
+      const words = new Map();
+      for (let w = WORD_LO; w <= WORD_HI; w++) words.set(w, 0n);
+      let threw = null;
+      try {
+        v3lib.getAmountOutV3Exact({
+          amountIn: 10n ** 18n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+          words, ticks: new Map(),
+          sqrtPx96: v3lib.getSqrtRatioAtTick(0), liquidity: LIQUIDITY, tick: 0,
+        });
+      } catch (e) { threw = e.message; }
+      expect(threw, "EMPTY word must not throw").to.equal(null);
+    });
+
+    it("does NOT throw for a word set to 0n (zeroForOne=false)", function () {
+      const words = new Map();
+      for (let w = WORD_LO; w <= WORD_HI; w++) words.set(w, 0n);
+      let threw = null;
+      try {
+        v3lib.getAmountOutV3Exact({
+          amountIn: 10n ** 18n, zeroForOne: false, fee: FEE, tickSpacing: SPACING,
+          words, ticks: new Map(),
+          sqrtPx96: v3lib.getSqrtRatioAtTick(0), liquidity: LIQUIDITY, tick: 0,
+        });
+      } catch (e) { threw = e.message; }
+      expect(threw, "EMPTY word must not throw").to.equal(null);
+    });
+
+    it("EMPTY != missing initialized tick: same wordPos, different outcome", function () {
+      const emptyWords = new Map();
+      for (let w = WORD_LO; w <= WORD_HI; w++) emptyWords.set(w, 0n);
+      let threwEmpty = null;
+      try {
+        v3lib.getAmountOutV3Exact({
+          amountIn: 10n ** 18n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+          words: emptyWords, ticks: new Map(),
+          sqrtPx96: v3lib.getSqrtRatioAtTick(10), liquidity: LIQUIDITY, tick: 10,
+        });
+      } catch (e) { threwEmpty = e.message; }
+      const { words: mw, ticks: mt } = fixtureWithInitializedTick(10, 0, false);
+      let threwMissing = null;
+      try {
+        v3lib.getAmountOutV3Exact({
+          amountIn: 10n ** 18n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+          words: mw, ticks: mt,
+          sqrtPx96: v3lib.getSqrtRatioAtTick(10), liquidity: LIQUIDITY, tick: 10,
+        });
+      } catch (e) { threwMissing = e.message; }
+      expect(threwEmpty, "EMPTY must not throw").to.equal(null);
+      expect(threwMissing, "missing initialized tick must throw").to.equal("missing-initialized-tick");
+    });
+  });
+
+  // ---- §4 Missing initialized tick AFTER a tick crossing -------------------
+  // All three ticks (+20 start, +10 tick A, 0 tick B) are in word 0.
+  describe("missing initialized tick after a tick crossing (critical case)", function () {
+    it("crosses tick A (data present), then throws at tick B (data missing)", function () {
+      const { wordPos: wa, bitPos: ba } = v3lib.position(10, SPACING);
+      const { wordPos: wb, bitPos: bb } = v3lib.position(0, SPACING);
+      const words = new Map();
+      for (let w = WORD_LO; w <= WORD_HI; w++) words.set(w, 0n);
+      words.set(wa, words.get(wa) | (1n << BigInt(ba)));
+      words.set(wb, words.get(wb) | (1n << BigInt(bb)));
+      const ticks = new Map();
+      ticks.set(10, 0n); // tick A: data present
+      // tick B (0): data MISSING
+      expectMissingTick(() => v3lib.getAmountOutV3Exact({
+        amountIn: 10n ** 30n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+        words, ticks,
+        sqrtPx96: v3lib.getSqrtRatioAtTick(20), liquidity: LIQUIDITY, tick: 20,
+      }));
+    });
+
+    it("CONTROL: same ticks with both data present -> crosses both, no throw", function () {
+      const { wordPos: wa, bitPos: ba } = v3lib.position(10, SPACING);
+      const { wordPos: wb, bitPos: bb } = v3lib.position(0, SPACING);
+      const words = new Map();
+      for (let w = WORD_LO; w <= WORD_HI; w++) words.set(w, 0n);
+      words.set(wa, words.get(wa) | (1n << BigInt(ba)));
+      words.set(wb, words.get(wb) | (1n << BigInt(bb)));
+      const ticks = new Map();
+      ticks.set(10, 0n);
+      ticks.set(0, 0n);
+      let threw = null; let r = null;
+      try {
+        r = v3lib.getAmountOutV3Exact({
+          amountIn: 10n ** 30n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+          words, ticks,
+          sqrtPx96: v3lib.getSqrtRatioAtTick(20), liquidity: LIQUIDITY, tick: 20,
+        });
+      } catch (e) { threw = e.message; }
+      expect(threw, "both ticks known -> must not throw").to.equal(null);
+      expect(r.crossed).to.be.gte(2);
+    });
+  });
+
+  // ---- §9 venueOutput() returns 0n -----------------------------------------
+  describe("venueOutput() returns 0n on missing initialized tick", function () {
+    const { venueOutput } = require("../../bot/profit");
+    const TOK_A = "0x" + "b1".repeat(20);
+    const TOK_B = "0x" + "b2".repeat(20);
+
+    function v3VenueMissingTick(startTick, initializedTick) {
+      const { words, ticks } = fixtureWithInitializedTick(startTick, initializedTick, false);
+      return {
+        kind: "v3",
+        pool: "0x" + "d1".repeat(20),
+        feeTier: FEE,
+        tokenA: { address: TOK_A, decimals: 18 },
+        tokenB: { address: TOK_B, decimals: 18 },
+        sqrtPx96: v3lib.getSqrtRatioAtTick(startTick),
+        liquidity: LIQUIDITY,
+        v3State: {
+          sqrtPriceX96: v3lib.getSqrtRatioAtTick(startTick).toString(),
+          tick: startTick,
+          liquidity: LIQUIDITY.toString(),
+          tickSpacing: SPACING,
+          words: [...words.entries()].map(([w, v]) => ({ word: w, value: v.toString() })),
+          ticks: [...ticks.entries()].map(([t, net]) => ({ tick: t, liquidityNet: net.toString() })),
+        },
+      };
+    }
+
+    it("venueOutput() returns 0n when initialized tick data is missing", function () {
+      const venue = v3VenueMissingTick(10, 0);
+      expectEq(venueOutput(venue, TOK_A, 10n ** 18n), 0n);
+    });
+
+    it("venueOutput() does NOT fall back to the approximate V3 quote", function () {
+      const venue = v3VenueMissingTick(10, 0);
+      venue.sqrtPx96 = 1n << 96n;
+      venue.liquidity = 10n ** 24n;
+      expectEq(venueOutput(venue, TOK_A, 10n ** 18n), 0n);
+    });
+  });
+
+  // ---- §10 findOpportunities() skips invalid state -------------------------
+  describe("findOpportunities() skips V3 venue with missing initialized tick", function () {
+    const { findOpportunities } = require("../../bot/profit");
+    const WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
+    const TOK = "0x" + "9a".repeat(20);
+    const OPTS = { maxPerPairBorrowBps: 2000, minProfitBnb: 0.0001 };
+
+    function v2SourceVenue() {
+      return {
+        kind: "v2",
+        tokenA: { address: WBNB, decimals: 18 },
+        tokenB: { address: TOK, decimals: 18 },
+        reserveA: 10n ** 24n * 2n,
+        reserveB: 10n ** 24n,
+        feeBps: 25,
+      };
+    }
+
+    function v3VenueMissingTick(startTick, initializedTick) {
+      const { words, ticks } = fixtureWithInitializedTick(startTick, initializedTick, false);
+      return {
+        kind: "v3",
+        pool: "0x" + "d2".repeat(20),
+        feeTier: FEE,
+        tokenA: { address: WBNB, decimals: 18 },
+        tokenB: { address: TOK, decimals: 18 },
+        sqrtPx96: v3lib.getSqrtRatioAtTick(startTick),
+        liquidity: LIQUIDITY,
+        v3State: {
+          sqrtPriceX96: v3lib.getSqrtRatioAtTick(startTick).toString(),
+          tick: startTick,
+          liquidity: LIQUIDITY.toString(),
+          tickSpacing: SPACING,
+          words: [...words.entries()].map(([w, v]) => ({ word: w, value: v.toString() })),
+          ticks: [...ticks.entries()].map(([t, net]) => ({ tick: t, liquidityNet: net.toString() })),
+        },
+      };
+    }
+
+    it("no opportunity is produced from a V3 venue with missing initialized tick", function () {
+      const venues = [v2SourceVenue(), v3VenueMissingTick(10, 0)];
+      const ops = findOpportunities(venues, null, OPTS);
+      expectEq(BigInt(ops.length), 0n);
+    });
+
+    it("needsVerification is NOT used as a bypass", function () {
+      const venues = [v2SourceVenue(), v3VenueMissingTick(10, 0)];
+      const ops = findOpportunities(venues, null, OPTS);
+      for (const o of ops) {
+        expect(o.needsVerification, "needsVerification must not bypass missing tick").to.equal(false);
+      }
+      expectEq(BigInt(ops.length), 0n);
+    });
+  });
+
+  // ---- §11 Mixed venues ----------------------------------------------------
+  describe("mixed sufficient/insufficient venues", function () {
+    const { findOpportunities } = require("../../bot/profit");
+    const WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
+    const TOK = "0x" + "9a".repeat(20);
+    const OPTS = { maxPerPairBorrowBps: 2000, minProfitBnb: 0.0001 };
+
+    function v2SourceVenue() {
+      return {
+        kind: "v2",
+        tokenA: { address: WBNB, decimals: 18 },
+        tokenB: { address: TOK, decimals: 18 },
+        reserveA: 10n ** 24n * 2n,
+        reserveB: 10n ** 24n,
+        feeBps: 25,
+      };
+    }
+
+    function v3VenueSufficient() {
+      const { words, ticks } = fixtureWithInitializedTick(0, 10, true);
+      return {
+        kind: "v3",
+        pool: "0x" + "d3".repeat(20),
+        feeTier: FEE,
+        tokenA: { address: WBNB, decimals: 18 },
+        tokenB: { address: TOK, decimals: 18 },
+        sqrtPx96: v3lib.getSqrtRatioAtTick(0),
+        liquidity: LIQUIDITY,
+        v3State: {
+          sqrtPriceX96: v3lib.getSqrtRatioAtTick(0).toString(),
+          tick: 0,
+          liquidity: LIQUIDITY.toString(),
+          tickSpacing: SPACING,
+          words: [...words.entries()].map(([w, v]) => ({ word: w, value: v.toString() })),
+          ticks: [...ticks.entries()].map(([t, net]) => ({ tick: t, liquidityNet: net.toString() })),
+        },
+      };
+    }
+
+    function v3VenueMissingTick() {
+      const { words, ticks } = fixtureWithInitializedTick(10, 0, false);
+      return {
+        kind: "v3",
+        pool: "0x" + "d4".repeat(20),
+        feeTier: FEE,
+        tokenA: { address: WBNB, decimals: 18 },
+        tokenB: { address: TOK, decimals: 18 },
+        sqrtPx96: v3lib.getSqrtRatioAtTick(10),
+        liquidity: LIQUIDITY,
+        v3State: {
+          sqrtPriceX96: v3lib.getSqrtRatioAtTick(10).toString(),
+          tick: 10,
+          liquidity: LIQUIDITY.toString(),
+          tickSpacing: SPACING,
+          words: [...words.entries()].map(([w, v]) => ({ word: w, value: v.toString() })),
+          ticks: [...ticks.entries()].map(([t, net]) => ({ tick: t, liquidityNet: net.toString() })),
+        },
+      };
+    }
+
+    it("sufficient venue can produce opportunity, missing-tick venue contributes nothing", function () {
+      const venues = [v2SourceVenue(), v3VenueSufficient(), v3VenueMissingTick()];
+      const badVenue = venues[2];
+      const words = new Map(badVenue.v3State.words.map((w) => [Number(w.word), BigInt(w.value)]));
+      const ticks = new Map(badVenue.v3State.ticks.map((t) => [Number(t.tick), BigInt(t.liquidityNet)]));
+      expectMissingTick(() => v3lib.getAmountOutV3Exact({
+        amountIn: 10n ** 18n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+        words, ticks,
+        sqrtPx96: v3lib.getSqrtRatioAtTick(10), liquidity: LIQUIDITY, tick: 10,
+      }));
+      const ops = findOpportunities(venues, null, OPTS);
+      for (const o of ops) expectGt(BigInt(o.netProfit), 0n);
+    });
+  });
+
+  // ---- §12 Poisoned approximate model --------------------------------------
+  describe("poisoned approximate model cannot be used on missing initialized tick", function () {
+    const { venueOutput } = require("../../bot/profit");
+    const amm = require("../../lib/amm");
+    const TOK_A = "0x" + "b1".repeat(20);
+    const TOK_B = "0x" + "b2".repeat(20);
+
+    it("returns 0n even when the approximate model would answer non-zero", function () {
+      const { words, ticks } = fixtureWithInitializedTick(10, 0, false);
+      const POISON_SQRT = 1n << 96n;
+      const POISON_LIQ = 10n ** 24n;
+      const venue = {
+        kind: "v3",
+        pool: "0x" + "d5".repeat(20),
+        feeTier: FEE,
+        tokenA: { address: TOK_A, decimals: 18 },
+        tokenB: { address: TOK_B, decimals: 18 },
+        sqrtPx96: POISON_SQRT,
+        liquidity: POISON_LIQ,
+        v3State: {
+          sqrtPriceX96: POISON_SQRT.toString(),
+          tick: 10,
+          liquidity: POISON_LIQ.toString(),
+          tickSpacing: SPACING,
+          words: [...words.entries()].map(([w, v]) => ({ word: w, value: v.toString() })),
+          ticks: [...ticks.entries()].map(([t, net]) => ({ tick: t, liquidityNet: net.toString() })),
+        },
+      };
+      // Sanity: the approximate model WOULD return non-zero with these fields.
+      expectGt(amm.getAmountOutV3(10n ** 18n, POISON_SQRT, POISON_LIQ, true, 500n), 0n);
+      // But venueOutput() returns 0n because the exact engine fails closed.
+      expectEq(venueOutput(venue, TOK_A, 10n ** 18n), 0n);
     });
   });
 });
