@@ -1,6 +1,6 @@
 // FLASH — profit estimation for V2/V3/DODO venues.
 // Finds the best 2-hop arbitrage across all venues sharing a token pair.
-const { getAmountOut, getAmountOutV3, v3Depth } = require("../lib/amm");
+const { getAmountOut, v3Depth } = require("../lib/amm");
 const { getAmountOutV3Exact } = require("../lib/v3"); // TASK 4.4: quote EXACT
 const dodo = require("../lib/dodo");
 const { pairKey } = require("./scanner");
@@ -29,20 +29,22 @@ function venueOutput(venue, tokenIn, amountIn) {
   }
   if (venue.kind === "v3") {
     const zeroForOne = a === venue.tokenA.address.toLowerCase();
-    const feeUnits = BigInt(venue.feeTier || 500);
     // TASK 4.4: când scannerul a citit starea PROFUNDĂ (tickSpacing + tickBitmap
     // words + initialized ticks cu liquidityNet — vezi scanner.enrichV3Venues),
     // folosim motorul EXACT din lib/v3 (swap-step cu tick crossing), identic
-    // cu QuoterV2. Fallback: modelul simplificat cu lichiditate constantă.
+    // cu QuoterV2.
+    // REGULĂ CRITICĂ (TASK 4.4-A): niciun fallback silențios la aproximare.
+    // Dacă exact quote e imposibil (stare lipsă) → 0 (oportunitatea se sare).
+    // Dacă exact quote aruncă → 0 (nu cadem pe modelul simplificat).
     const s = venue.v3State;
     if (s && Array.isArray(s.words) && Array.isArray(s.ticks) && s.words.length > 0) {
       try {
-        const words = new Map(s.words.map((w) => [w.word, BigInt(w.value)]));
-        const ticks = new Map(s.ticks.map((t) => [t.tick, BigInt(t.liquidityNet)]));
+        const words = new Map(s.words.map((w) => [Number(w.word), BigInt(w.value)]));
+        const ticks = new Map(s.ticks.map((t) => [Number(t.tick), BigInt(t.liquidityNet)]));
         const r = getAmountOutV3Exact({
           amountIn,
           zeroForOne,
-          fee: Number(venue.feeTier || 500),
+          fee: Number(venue.feeTier ?? 500),
           tickSpacing: s.tickSpacing,
           words,
           ticks,
@@ -50,16 +52,13 @@ function venueOutput(venue, tokenIn, amountIn) {
           liquidity: s.liquidity,
           tick: s.tick,
         });
-        if (r && r.amountOut > 0n) return r.amountOut;
+        return r.amountOut > 0n ? r.amountOut : 0n;
       } catch (_) {
-        // prea multe tick-uri traversate / stare parțială → model simplificat
+        return 0n; // Incomplete/invalid state: never use an approximate quote.
       }
     }
-    // TASK 4.4: fallback-ul legacy cere BigInt; coercie defensivă (venue-ul poate
-    // veni din JSON/cache unde BigInt devine string) ca să nu aruncăm TypeError.
-    const px = venue.sqrtPx96 != null ? BigInt(venue.sqrtPx96) : 0n;
-    const liq = venue.liquidity != null ? BigInt(venue.liquidity) : 0n;
-    return getAmountOutV3(BigInt(amountIn), px, liq, zeroForOne, feeUnits);
+    // Stare profundă indisponibilă → fără lichiditate cunoscută → 0 (nu aproximăm).
+    return 0n;
   }
   // PHASE 5 (audit): DODO PMM EXACT — nu mai returnăm 0. Quote off-chain
   // bit-exact cu DVMTrader.querySellBase/querySellQuote (vezi lib/dodo.js,

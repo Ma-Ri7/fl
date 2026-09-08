@@ -354,8 +354,9 @@ async function enrichV3Venues(provider, venues, opts = {}) {
         const r = wordRes[i];
         if (!r.success || r.returnData === "0x") continue;
         const wordVal = BigInt(cod.decode(["uint256"], r.returnData)[0]);
-        if (wordVal === 0n) continue;
+        // Keep successfully read empty words: absent words mean unknown state.
         words.push({ word: wordPositions[i], value: wordVal.toString() });
+        if (wordVal === 0n) continue;
         for (let bit = 0; bit < 256; bit++) {
           if (((wordVal >> BigInt(bit)) & 1n) === 0n) continue;
           tickPositions.push((wordPositions[i] * 256 + bit) * spacing);
@@ -397,7 +398,7 @@ async function enrichV3Venues(provider, venues, opts = {}) {
       };
       out.push(v);
     } catch (e) {
-      // Best-effort lens: a failing pool keeps its plain slot0-based quote path.
+      // Best-effort lens: without deep state the exact quote path returns zero.
     }
   }
   return out;

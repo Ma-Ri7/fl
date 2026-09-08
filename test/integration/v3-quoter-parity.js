@@ -55,7 +55,8 @@ describe("TASK 4.4 — V3 local quote (words+ticks) vs QuoterV2 parity", functio
     // Synthetic venue → enrichV3Venues attaches the deep v3State (slot0,
     // tickSpacing, tickBitmap words, initialized ticks w/ liquidityNet),
     // everything read at ONE block so the local quote is deterministic.
-    this.blockNumber = await this.provider.getBlockNumber();
+    // TASK 4.4-A: pin to a FIXED block for determinism (not live head).
+    this.blockNumber = 120500721;
     this.venue = {
       kind: 1,
       name: "PancakeV3-USDT-WBNB",
@@ -153,7 +154,15 @@ describe("TASK 4.4 — V3 local quote (words+ticks) vs QuoterV2 parity", functio
       }
     }
 
-    let total = 0, matched = 0, maxRelBps = 0n;
+    // TASK 4.4-A: tolerance is EXPLICIT.
+    //   pinned   → fixture is a fixed historical block, so both sides see the
+    //              identical state; only last-unit rounding may differ (1 bps).
+    //   unpinned → RPC refused blockTag and the fixture moved to head, which can
+    //              advance mid-test; allow 1% and require 90%.
+    const TOL_BPS_PINNED = 1n;
+    const TOL_BPS_UNPINNED = 100n;
+
+    let total = 0, matched = 0, maxRelBps = 0n, maxAbsDev = 0n;
     const fails = [];
     for (const c of cases) {
       const q = await quoteOnChain(c);
@@ -181,17 +190,30 @@ describe("TASK 4.4 — V3 local quote (words+ticks) vs QuoterV2 parity", functio
       total++;
       const dev = got > expected ? got - expected : expected - got;
       const relBps = (dev * 10000n) / expected;
-      if (relBps <= 100n) matched++; // within 1%
+      const tol = pinned ? TOL_BPS_PINNED : TOL_BPS_UNPINNED;
+      if (relBps <= tol) matched++;
       if (relBps > maxRelBps) maxRelBps = relBps;
+      if (dev > maxAbsDev) maxAbsDev = dev;
     }
+
+    const tol = pinned ? TOL_BPS_PINNED : TOL_BPS_UNPINNED;
     console.log(
-      "      parity: " + matched + "/" + total + " cases within 1% (max deviation " + maxRelBps + " bps)" +
+      "      parity: " + matched + "/" + total + " cases within " + tol + " bps" +
+      " (max deviation " + maxRelBps + " bps, max abs " + maxAbsDev + " units)" +
       (pinned
-        ? " | fully pinned to block " + self.blockNumber
-        : " | RPC rejected pinned eth_call → compared at latest")
+        ? " | fully pinned to FIXED block " + self.blockNumber
+        : " | RPC rejected pinned eth_call → compared at live head")
     );
-    if (fails.length) console.log("      threw: " + fails.slice(0, 3).join(" | "));
+
+    // No case may throw — a throw means the exact engine swallowed real state.
+    expect(fails, "getAmountOutV3Exact threw: " + fails.join(" | ")).to.have.lengthOf(0);
     expect(total, "no comparable cases").to.be.gte(15);
-    expect(matched / total, "parity below 90%").to.be.gte(0.9);
+    if (pinned) {
+      // Deterministic fixture → require 100% parity at 1 bps.
+      expect(matched, "parity failures on a pinned fixed block").to.equal(total);
+      expect(maxRelBps, "max deviation exceeds 1 bps on a pinned fixed block").to.be.at.most(1n);
+    } else {
+      expect(matched / total, "parity below 90% at live head").to.be.gte(0.9);
+    }
   });
 });
