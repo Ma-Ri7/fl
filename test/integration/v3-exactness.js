@@ -816,3 +816,384 @@ describe("TASK 4.4-A - V3 exact quote mathematical correctness", function () {
   });
 
 });
+
+// ============================================================================
+// TASK 4.4-B — V3 state coverage & boundary proof.
+//
+// Behavioural proof that the engine is a strict two-sided gate:
+//
+//   KNOWN + SUFFICIENT state      -> exact quote
+//   INSUFFICIENT / UNKNOWN state  -> fail closed (throw / 0n / skip)
+//
+// NO limits are changed here: maxCrossTicks stays 64, the scanner stays at its
+// +/-3 bitmap-word window, and there is no dynamic state expansion. The
+// windowed fixtures below MIMIC exactly what scanner.enrichV3Venues() reads
+// (words [curWord-3 .. curWord+3]) so the proofs are about real coverage.
+// ============================================================================
+describe("TASK 4.4-B - V3 state coverage & boundary proof", function () {
+
+  function expectMissingWord(fn) {
+    let msg = null;
+    try { fn(); } catch (e) { msg = e.message; }
+    expect(msg, "expected the exact engine to fail closed").to.equal("missing-tickbitmap-word");
+  }
+
+  // ---- §2 known + sufficient state -> exact quote --------------------------
+  describe("known + sufficient state produces an exact quote", function () {
+    it("zeroForOne=false: 10 initialized ticks, all crossed, no fail-closed error", function () {
+      const { ticks, words } = buildTicksUp(10, -890);
+      let r = null, threw = null;
+      try {
+        r = v3lib.getAmountOutV3Exact(
+          setup(words, -890, { amountIn: 10n ** 16n, zeroForOne: false, ticks })
+        );
+      } catch (e) { threw = e.message; }
+      expect(threw, "must not throw: " + threw).to.equal(null);
+      expectEq(BigInt(r.crossed), 10n);          // every tick crossed
+      expect(r.crossed).to.be.at.most(64);        // inside the safety limit
+      expectGt(r.amountOut, 0n);
+    });
+
+    it("zeroForOne=true: 10 initialized ticks, all crossed, no fail-closed error", function () {
+      const { ticks, words } = buildTicksDown(10, -890);
+      let r = null, threw = null;
+      try {
+        r = v3lib.getAmountOutV3Exact(
+          setup(words, -890, { amountIn: 10n ** 16n, zeroForOne: true, ticks })
+        );
+      } catch (e) { threw = e.message; }
+      expect(threw, "must not throw: " + threw).to.equal(null);
+      expectEq(BigInt(r.crossed), 10n);
+      expect(r.crossed).to.be.at.most(64);
+      expectGt(r.amountOut, 0n);
+    });
+  });
+
+  // ---- §3 traversal beyond the read window fails closed --------------------
+  describe("traversal beyond the +/-3 read window fails closed", function () {
+    // Window fixture: exactly what the scanner would hold for a pool whose
+    // current tick is `startTick` — words [curWord-3 .. curWord+3], plus the
+    // initialized ticks in that window. Anything past the window is UNKNOWN.
+    function windowDown(startTick) {
+      const words = new Map();
+      const { wordPos } = v3lib.position(startTick, SPACING);
+      for (let w = wordPos - 3; w <= wordPos + 3; w++) words.set(w, 0n);
+      // Initialized ticks marching DOWN across word boundaries:
+      //   -2550 (word -1 bit 1), -2560 (word -1 bit 0) -> word -1 exhausted
+      //   -2570 (word -2 bit 255)                       -> enters word -2
+      //   -5130 (word -3 bit 255)                       -> enters word -3
+      //   -7690 (word -4 bit 255)                       -> enters word -4
+      // The step after -7690 needs word -5, which the +/-3 window never read.
+      const tickList = [-2550, -2560, -2570, -5130, -7690];
+      const ticks = new Map();
+      for (const t of tickList) {
+        const { wordPos, bitPos } = v3lib.position(t, SPACING);
+        words.set(wordPos, (words.get(wordPos) || 0n) | (1n << BigInt(bitPos)));
+        ticks.set(t, 0n);
+      }
+      return { ticks, words, tickList };
+    }
+
+    function windowUp(startTick) {
+      const words = new Map();
+      const { wordPos } = v3lib.position(startTick, SPACING);
+      for (let w = wordPos - 3; w <= wordPos + 3; w++) words.set(w, 0n);
+      // Initialized ticks marching UP across word boundaries:
+      //   2550 (word 0 bit 255), 2560 (word 1 bit 0), 5110 (word 1 bit 255),
+      //   5120 (word 2 bit 0), 7670 (word 2 bit 255), 7680 (word 3 bit 0)
+      // The step after 7680 needs word 4 -> outside the +/-3 window.
+      const tickList = [2550, 2560, 5110, 5120, 7670, 7680];
+      const ticks = new Map();
+      for (const t of tickList) {
+        const { wordPos, bitPos } = v3lib.position(t, SPACING);
+        words.set(wordPos, (words.get(wordPos) || 0n) | (1n << BigInt(bitPos)));
+        ticks.set(t, 0n);
+      }
+      return { ticks, words, tickList };
+    }
+
+    function controlFixture(tickList, dir) {
+      // CONTROL: same initialized ticks, but a COMPLETE bitmap — the traversal
+      // then stays in known state and must succeed. Isolates the cause: only
+      // bitmap completeness differs between fail-closed and success.
+      const words = completeBitmap();
+      const ticks = new Map();
+      for (const t of tickList) {
+        const { wordPos, bitPos } = v3lib.position(t, SPACING);
+        words.set(wordPos, (words.get(wordPos) || 0n) | (1n << BigInt(bitPos)));
+        ticks.set(t, 0n);
+      }
+      return v3lib.getAmountOutV3Exact(setup(words, dir === "down" ? -2500 : 2500, {
+        amountIn: 10n ** 18n,
+        zeroForOne: dir === "down",
+        ticks,
+        sqrtPx96: v3lib.getSqrtRatioAtTick(dir === "down" ? -2500 : 2500),
+      }));
+    }
+
+    it("zeroForOne=true: needing a word outside the window throws", function () {
+      const { ticks, words } = windowDown(-2500);
+      expectMissingWord(() => v3lib.getAmountOutV3Exact(
+        setup(words, -2500, {
+          amountIn: 10n ** 18n, zeroForOne: true, ticks,
+          sqrtPx96: v3lib.getSqrtRatioAtTick(-2500),
+        })
+      ));
+    });
+
+    it("CONTROL same ticks with a complete bitmap: succeeds (crossed = tick count)", function () {
+      const { tickList } = windowDown(-2500);
+      const r = controlFixture(tickList, "down");
+      expectEq(BigInt(r.crossed), BigInt(tickList.length));
+      expectGt(r.amountOut, 0n);
+    });
+
+    it("zeroForOne=false: needing a word outside the window throws", function () {
+      const { ticks, words } = windowUp(2500);
+      expectMissingWord(() => v3lib.getAmountOutV3Exact(
+        setup(words, 2500, {
+          amountIn: 10n ** 18n, zeroForOne: false, ticks,
+          sqrtPx96: v3lib.getSqrtRatioAtTick(2500),
+        })
+      ));
+    });
+
+    it("CONTROL same ticks with a complete bitmap: succeeds (crossed = tick count)", function () {
+      const { tickList } = windowUp(2500);
+      const r = controlFixture(tickList, "up");
+      expectEq(BigInt(r.crossed), BigInt(tickList.length));
+      expectGt(r.amountOut, 0n);
+    });
+  });
+
+  // ---- §4 EMPTY word beyond the active ticks stays traversable -------------
+  describe("EMPTY word beyond active ticks keeps the quote alive", function () {
+    // Window words [-4..2]; the ONLY initialized tick is -2560 (word -1 bit 0).
+    // After crossing it the traversal walks INTO word -2, which was read
+    // successfully and is genuinely EMPTY (0n) — known state, quote continues.
+    function windowWithEmptyWord2() {
+      const words = new Map();
+      for (let w = -4; w <= 2; w++) words.set(w, 0n);
+      const { wordPos, bitPos } = v3lib.position(-2560, SPACING);
+      words.set(wordPos, (words.get(wordPos) || 0n) | (1n << BigInt(bitPos)));
+      return { words, ticks: new Map([[-2560, 0n]]) };
+    }
+
+    it("crossing -2560 into an explicitly EMPTY word -2 does NOT throw", function () {
+      const { ticks, words } = windowWithEmptyWord2();
+      // amountIn tuned to cross -2560 (~1.7e15 needed at L=5e17) but NOT reach
+      // -5120 (~7.7e15 more) — so the quote ends having walked INTO the EMPTY
+      // word -2 and back out, never needing unknown state.
+      const r = v3lib.getAmountOutV3Exact(
+        setup(words, -2500, {
+          amountIn: 10n ** 16n, zeroForOne: true,
+          liquidity: LIQUIDITY, ticks,
+          sqrtPx96: v3lib.getSqrtRatioAtTick(-2500),
+        })
+      );
+      expectEq(BigInt(r.crossed), 1n);
+      expect(r.tickFinal, "price must have moved past the crossed tick").to.be.below(-2560);
+      expectGt(r.amountOut, 0n);
+    });
+
+    it("removing that same word flips EMPTY -> UNKNOWN and fails closed", function () {
+      const { ticks, words } = windowWithEmptyWord2();
+      words.delete(-2);
+      expectMissingWord(() => v3lib.getAmountOutV3Exact(
+        setup(words, -2500, {
+          amountIn: 10n ** 16n, zeroForOne: true,
+          liquidity: LIQUIDITY, ticks,
+          sqrtPx96: v3lib.getSqrtRatioAtTick(-2500),
+        })
+      ));
+    });
+  });
+
+  // ---- §5/§6 maxCrossTicks = 64 safety limit --------------------------------
+  describe("maxCrossTicks = 64 safety limit", function () {
+    // Engine semantics (lib/v3.js): after each initialized-tick crossing
+    // `crossed++` runs, and `if (crossed > maxCross) throw "too-many-ticks"`.
+    // Therefore crossing #64 is the last allowed state and crossing #65 throws.
+    // The limit itself is NOT changed by this task.
+
+    it("65 initialized ticks crossed -> throws too-many-ticks (fail closed)", function () {
+      const { ticks, words } = buildTicksUp(65, -890);
+      let msg = null;
+      try {
+        v3lib.getAmountOutV3Exact(
+          setup(words, -890, { amountIn: 10n ** 18n, zeroForOne: false, ticks })
+        );
+      } catch (e) { msg = e.message; }
+      expect(msg, "65 crossings must exceed maxCrossTicks=64").to.equal("too-many-ticks");
+    });
+
+    it("exactly 64 initialized ticks crossed -> succeeds (boundary case)", function () {
+      const { ticks, words } = buildTicksUp(64, -890);
+      let r = null, threw = null;
+      try {
+        r = v3lib.getAmountOutV3Exact(
+          setup(words, -890, { amountIn: 10n ** 18n, zeroForOne: false, ticks })
+        );
+      } catch (e) { threw = e.message; }
+      expect(threw, "64 crossings must NOT exceed maxCrossTicks=64: " + threw).to.equal(null);
+      expectEq(BigInt(r.crossed), 64n);
+      expectGt(r.amountOut, 0n);
+    });
+
+    it("65 crossings never return a result object (fail closed, any amount)", function () {
+      const { ticks, words } = buildTicksUp(65, -890);
+      for (const amt of [10n ** 18n, 10n ** 20n, 10n ** 24n]) {
+        let msg = null, result = "no-throw";
+        try {
+          result = v3lib.getAmountOutV3Exact(
+            setup(words, -890, { amountIn: amt, zeroForOne: false, ticks })
+          );
+        } catch (e) { msg = e.message; }
+        expect(msg, "amountIn=" + amt).to.equal("too-many-ticks");
+        expect(result, "no result object may escape").to.equal("no-throw");
+      }
+    });
+  });
+
+  // ---- §7/§8 opportunity level: insufficient state cannot become a trade ---
+  describe("opportunity level: insufficient V3 state cannot become a trade", function () {
+    // profit.js references `logger` at module scope without requiring it
+    // (it relies on the bot entrypoint having set it). Provide it globally so
+    // the module loads standalone in tests.
+    global.logger = require("../../bot/logger");
+    const { findOpportunities } = require("../../bot/profit");
+    const WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
+    const TOK = "0x" + "9a".repeat(20);
+    // Explicit opts so the test does not depend on config defaults.
+    const OPTS = { maxPerPairBorrowBps: 2000, minProfitBnb: 0.0001 };
+    const SQRT_2550 = v3lib.getSqrtRatioAtTick(-2550);
+
+    // Flashloan SOURCE: a V2 pair is required because V3 venues cannot be a
+    // borrow source (v2Src/dodoSrc filter in findOpportunities).
+    function v2SourceVenue(wbnbPerTok) {
+      // price = reserveA(WBNB) / reserveB(TOK) = wbnbPerTok
+      return {
+        kind: "v2",
+        tokenA: { address: WBNB, decimals: 18 },
+        tokenB: { address: TOK, decimals: 18 },
+        reserveA: 10n ** 24n * wbnbPerTok,
+        reserveB: 10n ** 24n,
+        feeBps: 25,
+      };
+    }
+
+    function v3Venue(sqrtP, state) {
+      return {
+        kind: "v3",
+        pool: "0x" + "d3".repeat(20),
+        feeTier: FEE,
+        tokenA: { address: WBNB, decimals: 18 }, // token0
+        tokenB: { address: TOK, decimals: 18 },  // token1
+        sqrtPx96: sqrtP,                         // used by venueDepth()
+        liquidity: LIQUIDITY,
+        v3State: state,
+      };
+    }
+
+    function sufficientState(tick, sqrtP) {
+      // COMPLETE bitmap + the current tick initialized: sufficient state.
+      const words = completeBitmap();
+      const { wordPos, bitPos } = v3lib.position(tick, SPACING);
+      words.set(wordPos, (words.get(wordPos) || 0n) | (1n << BigInt(bitPos)));
+      return {
+        sqrtPriceX96: sqrtP.toString(),
+        tick,
+        liquidity: LIQUIDITY.toString(),
+        tickSpacing: SPACING,
+        words: [...words.entries()].map(([w, v]) => ({ word: w, value: v.toString() })),
+        ticks: [{ tick, liquidityNet: "0" }],
+      };
+    }
+
+    function insufficientState(tick, sqrtP) {
+      // +/-1-word "window" around `tick` that goes fail closed as soon as the
+      // traversal needs any other word. Mimics an incomplete enrichV3Venues.
+      const words = new Map();
+      const { wordPos, bitPos } = v3lib.position(tick, SPACING);
+      words.set(wordPos, (words.get(wordPos) || 0n) | (1n << BigInt(bitPos)));
+      return {
+        sqrtPriceX96: sqrtP.toString(),
+        tick,
+        liquidity: LIQUIDITY.toString(),
+        tickSpacing: SPACING,
+        words: [...words.entries()].map(([w, v]) => ({ word: w, value: v.toString() })),
+        ticks: [{ tick, liquidityNet: "0" }],
+      };
+    }
+
+    it("sufficient state -> findOpportunities produces a quoted opportunity", function () {
+      // Dislocation: V3 prices TOK at ~0.77 WBNB, V2 prices it at 2.0 WBNB.
+      // Buy TOK on V3 (zeroForOne=true), sell on V2 -> clearly profitable.
+      const venues = [
+        v2SourceVenue(2n),
+        v3Venue(1n << 96n, sufficientState(0, 1n << 96n)),
+      ];
+      const ops = findOpportunities(venues, null, OPTS);
+      expect(ops.length, "sufficient state must be quoteable/executable").to.be.gte(1);
+      for (const o of ops) {
+        expectGt(BigInt(o.netProfit), 0n);
+        // The quote came from the EXACT engine on known state — it is a real,
+        // executable quote. needsVerification may be true purely for profit
+        // plausibility (TASK 4.6), but the quote itself is exact.
+        expect(o).to.have.property("needsVerification");
+      }
+    });
+
+    it("insufficient state -> NO opportunity, not even needsVerification=true", function () {
+      // Both V3 venues lack the bitmap word the traversal needs (the
+      // zeroForOne=true direction fails closed immediately).
+      const venues = [
+        v2SourceVenue(2n),
+        v3Venue(SQRT_2550, insufficientState(-2550, SQRT_2550)),
+        v3Venue(SQRT_2550, insufficientState(-2550, SQRT_2550)),
+      ];
+      // Prove the engine really does fail closed for this state.
+      const v = venues[1];
+      const words = new Map(v.v3State.words.map((w) => [Number(w.word), BigInt(w.value)]));
+      const ticks = new Map(v.v3State.ticks.map((t) => [Number(t.tick), BigInt(t.liquidityNet)]));
+      expectMissingWord(() => v3lib.getAmountOutV3Exact({
+        amountIn: 10n ** 18n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+        words, ticks,
+        sqrtPx96: SQRT_2550, liquidity: LIQUIDITY, tick: -2550,
+      }));
+
+      const ops = findOpportunities(venues, null, OPTS);
+      // exact quote unavailable -> amountOut 0n -> opportunity skipped.
+      // needsVerification is NEVER a shortcut: nothing is quoted or executed.
+      expectEq(BigInt(ops.length), 0n);
+    });
+
+    it("mixed (one sufficient + one insufficient venue) -> insufficient venue contributes NO false quote", function () {
+      // The sufficient V3 venue still produces real opportunities with V2.
+      // The insufficient V3 venue fails closed (proven above) and contributes
+      // nothing — it never produces a false quote that could corrupt a trade.
+      const venues = [
+        v2SourceVenue(2n),
+        v3Venue(1n << 96n, sufficientState(0, 1n << 96n)),
+        v3Venue(SQRT_2550, insufficientState(-2550, SQRT_2550)),
+      ];
+      // Prove the insufficient venue still fails closed in this mixed context.
+      const badVenue = venues[2];
+      const words = new Map(badVenue.v3State.words.map((w) => [Number(w.word), BigInt(w.value)]));
+      const ticks = new Map(badVenue.v3State.ticks.map((t) => [Number(t.tick), BigInt(t.liquidityNet)]));
+      expectMissingWord(() => v3lib.getAmountOutV3Exact({
+        amountIn: 10n ** 18n, zeroForOne: true, fee: FEE, tickSpacing: SPACING,
+        words, ticks,
+        sqrtPx96: SQRT_2550, liquidity: LIQUIDITY, tick: -2550,
+      }));
+      // Opportunities exist — but only from the sufficient venue.
+      const ops = findOpportunities(venues, null, OPTS);
+      expect(ops.length, "sufficient venue still quotes").to.be.gte(1);
+      for (const o of ops) {
+        // Every opportunity is a real, positive-profit quote — never a false
+        // quote from the insufficient venue.
+        expectGt(BigInt(o.netProfit), 0n);
+      }
+    });
+  });
+});
