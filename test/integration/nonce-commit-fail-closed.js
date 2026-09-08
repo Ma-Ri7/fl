@@ -163,4 +163,30 @@ describe("TASK 4.5-A-FIX — Fail-closed la commit() eșuat după txHash", funct
       expect(d).to.equal(13);
     });
   });
+
+  // ---- Part C: nonce-not-reserved does NOT add to blocked -----------------
+  describe("commit() on unknown nonce does NOT add to blocked", function () {
+    it("commit(999) for unknown nonce throws and does not block", function () {
+      const { mgr } = makeManager({ startNonce: 10 });
+      let err = null;
+      try { mgr.commit(999, "0xhash"); } catch (e) { err = e; }
+      expect(err).to.not.equal(null);
+      expect(err.message).to.include("nonce-not-reserved");
+      // CRITICAL: unknown nonce must NOT be added to blocked
+      expect(mgr.blocked.has(999)).to.equal(false);
+    });
+
+    it("unknown nonce does not contaminate reserve()", async function () {
+      const { mgr } = makeManager({ startNonce: 10 });
+      // Try to commit an unknown nonce (should throw, not block)
+      try { mgr.commit(999, "0xhash"); } catch (e) { /* expected */ }
+      expect(mgr.blocked.has(999)).to.equal(false);
+
+      // Reserve should work normally
+      const a = await mgr.reserve();
+      expect(a).to.equal(10);
+      const b = await mgr.reserve();
+      expect(b).to.equal(11);
+    });
+  });
 });

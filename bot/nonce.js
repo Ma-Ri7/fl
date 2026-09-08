@@ -69,11 +69,12 @@ class NonceManager {
     const n = Number(nonce);
     if (!this.reserved.has(n)) {
       if (this.pending.has(n)) {
-        // Move to blocked before throwing — nonce must never be reused.
+        // Already committed — ensure it stays blocked (known on-chain).
         this.blocked.add(n);
         throw new Error(`nonce-already-committed: nonce ${n} is already committed`);
       }
-      this.blocked.add(n);
+      // Completely unknown nonce — no evidence it was used on-chain.
+      // DO NOT add to blocked; just throw.
       throw new Error(`nonce-not-reserved: nonce ${n} was not reserved by this manager`);
     }
     this.reserved.delete(n);
