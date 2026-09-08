@@ -242,6 +242,10 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
         "invalid-nonce-manager: opts.nonceManager must expose reserve/commit/rollback"
       );
     }
+    // Wallet identity check: if the manager exposes validateWallet, use it.
+    if (typeof m.validateWallet === "function") {
+      m.validateWallet(wallet);
+    }
     nonceMgr = m;
   } else {
     nonceMgr = new NonceManager(wallet, config.bot.maxNonceGap);
@@ -265,13 +269,21 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
       nonce,
     });
     if (result.ok && result.status === "accepted") {
-      nonceMgr.commit(nonce, result.txHash);
+      try {
+        nonceMgr.commit(nonce, result.txHash);
+      } catch (e) {
+        logger.error(`[executor] commit failed (nonce=${nonce}): ${e.message}`);
+      }
       return { ok: true, txHash: result.txHash, blockNumber: result.block, profit: fq.net, minProfit: fq.minProfit, private: true, nonce };
     }
     if (result.status === "unknown") {
       // CRITICAL: nu cunoaștem starea — nicio a doua submisie cu acest nonce.
       // NonceManager păstrează un tombstone până la reap.
-      nonceMgr.commit(nonce, null);
+      try {
+        nonceMgr.commit(nonce, null);
+      } catch (e) {
+        logger.error(`[executor] commit-tombstone failed (nonce=${nonce}): ${e.message}`);
+      }
       logger.warn(`[executor] private submission UNKNOWN (nonce=${nonce}) — NU se face fallback public`);
       return { ok: false, reason: "private-unknown", err: result.error, nonce, txHash: result.txHash || null };
     }
@@ -287,10 +299,20 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
       gasPrice,
       nonce,
     });
-    nonceMgr.commit(nonce, tx.hash);
+    try {
+      nonceMgr.commit(nonce, tx.hash);
+    } catch (e) {
+      logger.error(`[executor] commit failed (nonce=${nonce}): ${e.message}`);
+    }
     return { ok: true, txHash: tx.hash, profit: fq.net, minProfit: fq.minProfit, private: false, nonce };
   } catch (e) {
-    nonceMgr.rollback(nonce);
+    try {
+      nonceMgr.rollback(nonce);
+    } catch (rbErr) {
+      // rollback can fail if nonce was already committed (tx hash exists) or
+      // already rolled back — log but don't mask the original error.
+      logger.error(`[executor] rollback failed (nonce=${nonce}): ${rbErr.message}`);
+    }
     return { ok: false, reason: "broadcast-fail", err: e.message.slice(0, 120), nonce };
   }
 }
