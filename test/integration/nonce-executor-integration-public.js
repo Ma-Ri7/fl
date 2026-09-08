@@ -1,6 +1,9 @@
 // TASK 4.5-A-FIX-2 — Executor integration (public scenarios)
 const { expect } = require("chai");
 
+// Capture the REAL NonceManager BEFORE any test stubs the nonce module.
+const RealNonceManager = require("../../bot/nonce").NonceManager;
+
 const WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
 const BASE = "0x" + "9a".repeat(20);
 const E18 = 10n ** 18n;
@@ -75,8 +78,7 @@ describe("TASK 4.5-A-FIX-2 — Executor integration (public)", function () {
   it("A5: nonce with hash cannot be reused after commit failure", async function () {
     // Use a real NonceManager (not stubbed) to test nonce reuse prevention
     const wallet = makeWallet([]);
-    const { NonceManager } = require("../../bot/nonce");
-    const realMgr = new NonceManager(wallet, 5);
+    const realMgr = new RealNonceManager(wallet, 5);
     await realMgr.init();
 
     // Manually reserve a nonce and simulate commit failure
@@ -121,6 +123,65 @@ describe("TASK 4.5-A-FIX-2 — Executor integration (public)", function () {
       expect(result.reason).to.equal("broadcast-fail");
       expect(rollbackSpy.length).to.equal(1);
       expect(rollbackSpy[0]).to.equal(7);
+    });
+  });
+
+  // ---- Part A: Executor + REAL NonceManager first-commit failure ----------
+  describe("executor + REAL NonceManager first-commit failure (end-to-end)", function () {
+    class ThrowingMap extends Map {
+      set() { throw new Error("simulated-first-commit-failure"); }
+    }
+
+    it("C/D/E/F: executeOpp → real reserve → commit fails → ok=false, nonce-commit-failed, txHash preserved, rollback=0", async function () {
+      await withIsolatedExecutor(async (executor) => {
+        const sent = [];
+        const wallet = makeWallet(sent);
+        const realMgr = new RealNonceManager(wallet, 5);
+        await realMgr.init();
+
+        // Inject controlled failure: pending.set() throws on commit
+        realMgr.pending = new ThrowingMap();
+        const rollbackSpy = [];
+        realMgr.rollback = (n) => { rollbackSpy.push(n); };
+
+        const result = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), wallet, makeProvider(), { nonceManager: realMgr });
+
+        // C: ok=false
+        expect(result.ok).to.equal(false);
+        // D: reason
+        expect(result.reason).to.equal("nonce-commit-failed");
+        // E: txHash preserved
+        expect(result.txHash).to.equal("0x" + "tx".repeat(10));
+        // F: rollback NOT called
+        expect(rollbackSpy.length).to.equal(0);
+      });
+    });
+
+    it("G: after executeOpp commit failure, same nonce cannot be returned by subsequent reserve()", async function () {
+      await withIsolatedExecutor(async (executor) => {
+        const sent = [];
+        const wallet = makeWallet(sent, "0x" + "e1".repeat(20), 7);
+        const realMgr = new RealNonceManager(wallet, 5);
+        await realMgr.init();
+
+        // Inject controlled failure
+        realMgr.pending = new ThrowingMap();
+
+        const result = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), wallet, makeProvider(), { nonceManager: realMgr });
+        expect(result.ok).to.equal(false);
+        expect(result.reason).to.equal("nonce-commit-failed");
+        expect(result.nonce).to.equal(7);
+
+        // Nonce 7 is blocked
+        expect(realMgr.blocked.has(7)).to.equal(true);
+
+        // Restore normal pending for subsequent reserve
+        realMgr.pending = new Map();
+
+        // Next reserve must NOT return 7
+        const nextNonce = await realMgr.reserve();
+        expect(nextNonce).to.not.equal(7);
+      });
     });
   });
 });

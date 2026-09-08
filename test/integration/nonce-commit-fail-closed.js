@@ -189,4 +189,47 @@ describe("TASK 4.5-A-FIX — Fail-closed la commit() eșuat după txHash", funct
       expect(b).to.equal(11);
     });
   });
+
+  // ---- Part A: REAL NonceManager FIRST commit failure → blocked -----------
+  describe("REAL NonceManager: FIRST commit failure blocks the nonce", function () {
+    // ThrowingMap: real Map but .set() throws — a controlled failure point
+    // that exercises the real commit() fail-closed path.
+    class ThrowingMap extends Map {
+      set() { throw new Error("simulated-first-commit-failure"); }
+    }
+
+    it("reserve(N) → FIRST commit throws → blocked.has(N) === true", async function () {
+      const { mgr } = makeManager({ startNonce: 10 });
+      const n = await mgr.reserve();
+      expect(n).to.equal(10);
+
+      // Inject controlled failure: pending.set() throws on FIRST commit
+      mgr.pending = new ThrowingMap();
+
+      let err = null;
+      try { mgr.commit(n, "0xhash"); } catch (e) { err = e; }
+      expect(err).to.not.equal(null);
+      expect(err.message).to.include("simulated-first-commit-failure");
+
+      // CRITICAL: nonce is blocked, not lost
+      expect(mgr.blocked.has(n)).to.equal(true);
+      expect(mgr.reserved.has(n)).to.equal(false);
+      expect(mgr.pending.has(n)).to.equal(false);
+    });
+
+    it("FIRST commit failure → next reserve() does NOT return N", async function () {
+      const { mgr } = makeManager({ startNonce: 10 });
+      const n = await mgr.reserve();
+      expect(n).to.equal(10);
+
+      mgr.pending = new ThrowingMap();
+      try { mgr.commit(n, "0xhash"); } catch (e) { /* expected */ }
+      expect(mgr.blocked.has(n)).to.equal(true);
+
+      // Observable behavior: reserve() must skip blocked nonce
+      const m = await mgr.reserve();
+      expect(m).to.not.equal(10);
+      expect(m).to.equal(11);
+    });
+  });
 });

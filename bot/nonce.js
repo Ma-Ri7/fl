@@ -78,7 +78,15 @@ class NonceManager {
       throw new Error(`nonce-not-reserved: nonce ${n} was not reserved by this manager`);
     }
     this.reserved.delete(n);
-    this.pending.set(n, { hash: hash || null, ts: Date.now() });
+    try {
+      this.pending.set(n, { hash: hash || null, ts: Date.now() });
+    } catch (e) {
+      // FAIL-CLOSED: a RESERVED nonce whose commit failed must be blocked —
+      // it was already handed out and may already be used on-chain. Never
+      // let it become "lost" (neither reserved nor pending nor blocked).
+      this.blocked.add(n);
+      throw e;
+    }
   }
 
   /**
