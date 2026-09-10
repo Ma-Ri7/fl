@@ -200,8 +200,10 @@ class PnLTracker {
     let grossProfitRaw = null;
     let grossProfitStatus = PnLStatus.UNKNOWN;
     if (receipt && receipt.status === 1) {
-      // Only calculate gross profit when we have a confirmed receipt
-      grossProfitRaw = afterBalanceRaw - beforeBalanceRaw - borrowedAmountRaw + repaidAmountRaw - externalInflowRaw + externalOutflowRaw - flashloanFeeRaw;
+      // Gross profit = balance delta minus flashloan principal plus repayment
+      // The flashloan fee is already reflected in afterBalanceRaw (it reduces
+      // the final balance), so we do NOT subtract it here to avoid double-counting.
+      grossProfitRaw = afterBalanceRaw - beforeBalanceRaw - borrowedAmountRaw + repaidAmountRaw - externalInflowRaw + externalOutflowRaw;
       grossProfitStatus = PnLStatus.REALIZED;
     }
 

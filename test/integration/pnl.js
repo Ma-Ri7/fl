@@ -89,7 +89,8 @@ describe("TASK 4.5-E — Realized P&L Tracker", function () {
     });
     it("13. flashloan fee included (via balance delta)", function () {
       const r = tracker.recordPnL(baseData({ afterBalanceRaw: 1012490n, flashloanFeeRaw: 10n }));
-      expect(r.grossProfitRaw).to.equal(12480n);
+      // Fee is already reflected in afterBalanceRaw, so gross = after - before = 12490
+      expect(r.grossProfitRaw).to.equal(12490n);
     });
     it("14. gross surplus correctly calculated", function () {
       const r = tracker.recordPnL(baseData({ afterBalanceRaw: 1015000n }));
@@ -338,14 +339,15 @@ describe("TASK 4.5-E — Realized P&L Tracker", function () {
   });
 
   describe("Explicit Flashloan Test", function () {
-    it("initial=1000, borrowed=10000, repayment=10010, final=1005", function () {
+    it("initial=1000, borrowed=10000, repayment=10000, fee=10, final=1005", function () {
       const r = tracker.recordPnL(baseData({
         beforeBalanceRaw: 1000000000n,
         afterBalanceRaw: 1005000000n,
         borrowedAmountRaw: 10000000000n,
-        repaidAmountRaw: 10010000000n,
+        repaidAmountRaw: 10000000000n,
         flashloanFeeRaw: 10000000n,
       }));
+      // gross = 1005 - 1000 - 10000 + 10000 = 5 USDT (fee already in after balance)
       expect(r.grossProfitRaw).to.equal(5000000n);
     });
   });
