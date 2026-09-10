@@ -136,6 +136,79 @@ class NonceManager {
     }
   }
 
+/**
+   * Validates and normalizes a nonce value returned by the chain.
+   * Rejects undefined, null, NaN, ±Infinity, negative, fractional, and any
+   * value that is NOT a Number.isSafeInteger(). Never coerces silently.
+   * @param {string|number|bigint} value — chain pending nonce
+   * @returns {number} the validated nonce
+   * @throws {Error} "invalid-chain-pending-nonce: ..." on any invalid value
+   */
+  _validateNonce(value) {
+    if (value === undefined || value === null) {
+      throw new Error("invalid-chain-pending-nonce: value is undefined or null");
+    }
+    if (typeof value !== "number" && typeof value !== "string" && typeof value !== "bigint") {
+      throw new Error(`invalid-chain-pending-nonce: unexpected type ${typeof value}`);
+    }
+    const n = Number(value);
+    if (!Number.isFinite(n)) {
+      throw new Error(`invalid-chain-pending-nonce: not finite (${String(value)})`);
+    }
+    if (!Number.isInteger(n)) {
+      throw new Error(`invalid-chain-pending-nonce: non-integer (${String(value)})`);
+    }
+    if (n < 0) {
+      throw new Error(`invalid-chain-pending-nonce: negative (${String(value)})`);
+    }
+    if (!Number.isSafeInteger(n)) {
+      throw new Error(`invalid-chain-pending-nonce: not a safe integer (${String(value)})`);
+    }
+    return n;
+  }
+
+  /**
+   * Reconciliază nonce-ul local cu nonce-ul "pending" on-chain.
+   *
+   * FAIL-CLOSED + MONOTONIC:
+   *   - serializat cu reserve() prin ACEEAȘI mutex `_reserveChain`;
+   *   - next NON-REGRESEZĂ: newNext = max(currentNext, chainPendingNonce);
+   *   - dacă next === null (restart/manager proaspăt), next = chainPendingNonce;
+   *   - reserved/pending/blocked NICIODATĂ nu sunt modificate sau șterse;
+   *   - reconcile() NU apelează niciodată rollback();
+   *   - RPC failure sau nonce invalid → stato local NESCHIMBAT, eroarea se propagă.
+   *
+   * Prin default nonce-ul este citit cu this.wallet.getNonce("pending").
+   * Pentru testare se poate injecta opts.getPendingNonce — state machine-ul
+   * rămâNE cel real.
+   *
+   * @param {object} opts
+   *   - {string|object} [wallet]         dacă este dat, identitatea e validată (case-insensitive)
+   *   - {function} [getPendingNonce]     async () => nonce  (dependency injection de test)
+   * @returns {Promise<number>} next-ul reconcilat
+   * @throws {Error} "wallet-mismatch" | "invalid-chain-pending-nonce" | eroare RPC
+   */
+  async reconcile(opts = {}) {
+    if (opts.wallet) this.validateWallet(opts.wallet);
+
+    const fetchPending = opts.getPendingNonce || (() => this.wallet.getNonce("pending"));
+
+    // Encodează întreaga operație pe același lanț de promise ca reserve():
+    // reserve() și reconcile() nu pot citi/modifica `next` concurent.
+    const result = this._reserveChain.then(async () => {
+      const raw = await fetchPending();
+      const chainPending = this._validateNonce(raw);
+      if (this.next === null) {
+        this.next = chainPending;
+      } else {
+        this.next = Math.max(this.next, chainPending);
+      }
+      this.lastSync = Date.now();
+      return this.next;
+    });
+    this._reserveChain = result.catch(() => {});
+    return result;
+  }
   /**
    * Reap: verifică pending-urile; cele confirmate sau dispărute se șterg.
    * Se apelează la fiecare ciclu de scan.
