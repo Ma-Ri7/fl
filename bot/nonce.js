@@ -217,11 +217,11 @@ class NonceManager {
   async reap(provider) {
     for (const [nonce, entry] of [...this.pending.entries()]) {
       const hash = entry && typeof entry === "object" ? entry.hash : entry;
-      const ts = entry && typeof entry === "object" ? entry.ts : 0;
       if (hash === null || hash === undefined) {
-        // tombstone: submisie privată UNKNOWN — slot rămâne blocat 90s ca să
-        // nu reutilizăm nonce-ul în timp ce tx-ul poate încă fi inclus.
-        if (Date.now() - ts > 90000) this.pending.delete(nonce);
+        // Tombstone: submisie privată UNKNOWN/ambiguă (TASK 4.5-D). Tranzacția
+        // POATE fi acceptată de relay dar invizibilă pentru RPC-ul public —
+        // timpul NU este dovadă de drop. Slotul se eliberează EXCLUSIV prin
+        // dovezi on-chain (reconcile / resync de mai jos), niciodată după vârstă.
         continue;
       }
       try {

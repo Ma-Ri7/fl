@@ -14,6 +14,7 @@ const abi = require("../artifacts/contracts/FlashLoanArbitrage.sol/FlashLoanArbi
 const config = require("./config");
 const bloxroute = require("./bloxroute");
 const { NonceManager } = require("./nonce");
+const { TransactionTracker } = require("./tx-tracker");
 const scanner = require("./scanner");
 const profit = require("./profit");
 const dodo = require("../lib/dodo");
@@ -255,6 +256,35 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     return { ok: false, reason: "nonce-saturation" };
   }
 
+  // ---- 6b. TRANSACTION TRACKER (TASK 4.5-D §20) -----------------------------
+  // Tracker-ul este AUTORITATEA pentru ciclul de viață al tranzacției.
+  // Recordul se creează DUPĂ rezervare și ÎNAINTE de orice submisie:
+  //   - tracker failure aici => nicio submisie nu a avut loc => rollback SIGUR
+  //     (TASK 4.5-D §8);
+  //   - după acceptarea relay-ului, erorile tracker-ului NU afectează ownership
+  //     nonce-ului (fail-closed, TASK 4.5-D §21) — doar se loghează.
+  const tracker = opts.txTracker != null ? opts.txTracker : new TransactionTracker();
+  if (
+    opts.txTracker != null &&
+    (typeof opts.txTracker.create !== "function" ||
+      typeof opts.txTracker.markSubmitted !== "function" ||
+      typeof opts.txTracker.poll !== "function")
+  ) {
+    throw new Error("invalid-tx-tracker: opts.txTracker must expose create/markSubmitted/poll");
+  }
+  let recId = null;
+  try {
+    recId = tracker.create({ wallet: trader, nonce }).id;
+  } catch (e) {
+    // Nicio submisie încercată — rollback permis (dovedește: nonce never broadcast).
+    try { nonceMgr.rollback(nonce); } catch (_) {}
+    return { ok: false, reason: "tracker-create-failed", err: e.message.slice(0, 120), nonce };
+  }
+  // Tracker failures NEVER change nonce ownership decisions (§21).
+  const track = (fn) => {
+    try { fn(); } catch (e) { logger.error(`[executor] tracker error: ${e.message}`); }
+  };
+
   // ---- 7. SUBMISIE (privat cu fallback SIGUR) -------------------------------
   const useBloxroute = await bloxroute.isAvailable();
   if (useBloxroute) {
@@ -269,21 +299,33 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
       nonce,
     });
     if (result.ok && result.status === "accepted") {
-      // Private submission ACCEPTED — txHash exists. Commit MUST succeed.
-      // FAIL-CLOSED: if commit throws, nonce is blocked forever (never rolled back).
+      // Private submission ACCEPTED — relay acceptance ≠ on-chain success
+      // (TASK 4.5-D §18). Track the submission; a missing/malformed hash makes
+      // the acceptance AMBIGUOUS → tombstone commit, never a rollback.
+      let usableHash = null;
+      if (result.txHash) {
+        track(() => tracker.markSubmitted(recId, result.txHash, { wallet: trader, mode: "private" }));
+        usableHash = result.txHash;
+      } else {
+        track(() => tracker.transition(recId, "UNKNOWN", { lastError: "relay accepted without usable txHash" }));
+      }
+      // Commit MUST succeed. FAIL-CLOSED: if commit throws, nonce is blocked
+      // forever (never rolled back).
       try {
-        nonceMgr.commit(nonce, result.txHash);
+        nonceMgr.commit(nonce, usableHash);
       } catch (e) {
         logger.error(`[executor] nonce commit failed (private, nonce=${nonce}, txHash=${result.txHash}): ${e.message}`);
         // INVARIANT: txHash exists + commit failure = nonce must remain blocked.
         // NEVER rollback. Return explicit failure.
         return { ok: false, reason: "nonce-commit-failed", nonce, txHash: result.txHash, private: true, err: e.message };
       }
-      return { ok: true, txHash: result.txHash, blockNumber: result.block, profit: fq.net, minProfit: fq.minProfit, private: true, nonce };
+      return { ok: true, txHash: result.txHash, blockNumber: result.block, profit: fq.net, minProfit: fq.minProfit, private: true, nonce, trackerId: recId };
     }
     if (result.status === "unknown") {
       // Private submission UNKNOWN — no txHash, but nonce may still be used.
-      // commit(nonce, null) marks a tombstone. If it throws, nonce is blocked.
+      // TASK 4.5-D §7: ambiguous submission → tracker UNKNOWN, tombstone commit,
+      // NEVER rollback (relay may have accepted the tx).
+      track(() => tracker.transition(recId, "UNKNOWN", { lastError: result.error }));
       try {
         nonceMgr.commit(nonce, null);
       } catch (e) {
@@ -292,7 +334,7 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
         return { ok: false, reason: "nonce-commit-failed", nonce, txHash: null, private: true, err: e.message };
       }
       logger.warn(`[executor] private submission UNKNOWN (nonce=${nonce}) — NU se face fallback public`);
-      return { ok: false, reason: "private-unknown", err: result.error, nonce, txHash: result.txHash || null };
+      return { ok: false, reason: "private-unknown", err: result.error, nonce, txHash: result.txHash || null, trackerId: recId };
     }
     // status 'failed' = respins definitiv ÎNAINTE de acceptare → fallback public
     logger.warn(`[executor] bloxroute failed (definitiv), fallback public: ${result.error}`);
@@ -306,8 +348,9 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
       gasPrice,
       nonce,
     });
-    // Public broadcast succeeded — txHash exists. Commit MUST succeed.
+    // Public broadcast succeeded — txHash exists. Track it, then commit.
     // FAIL-CLOSED: if commit throws, nonce is blocked forever (never rolled back).
+    track(() => tracker.markSubmitted(recId, tx.hash, { wallet: trader, mode: "public" }));
     try {
       nonceMgr.commit(nonce, tx.hash);
     } catch (e) {
@@ -316,9 +359,12 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
       // NEVER rollback. Return explicit failure.
       return { ok: false, reason: "nonce-commit-failed", nonce, txHash: tx.hash, private: false, err: e.message };
     }
-    return { ok: true, txHash: tx.hash, profit: fq.net, minProfit: fq.minProfit, private: false, nonce };
+    return { ok: true, txHash: tx.hash, profit: fq.net, minProfit: fq.minProfit, private: false, nonce, trackerId: recId };
   } catch (e) {
-    // Broadcast failure BEFORE txHash exists — rollback is safe.
+    // Broadcast failure BEFORE txHash exists — rollback is safe (semantica
+    // acceptată în 4.5-A). Tracker: submission attempt recorded as UNKNOWN
+    // (fail-closed; tracker-ul nu eliberează niciodată nonce-ul).
+    track(() => tracker.transition(recId, "UNKNOWN", { lastError: `broadcast fail: ${e.message}` }));
     try {
       nonceMgr.rollback(nonce);
     } catch (rbErr) {

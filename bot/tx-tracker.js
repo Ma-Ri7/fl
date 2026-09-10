@@ -105,8 +105,10 @@ class TransactionTracker {
    * @param {object} meta optional fields to persist on the record
    * @returns {object} read-only snapshot AFTER the transition
    */
-  transition(id, to, meta = {}) {
+  transition(id, to, meta = {}, wallet) {
     const rec = this._getRecord(id);
+    // Wallet identity (TASK 4.5-D §27): enforced BEFORE any mutation.
+    this._checkWallet(rec, wallet);
     if (!TransactionTracker.STATES.includes(to)) {
       throw new Error(`tracker: unknown state (${to})`);
     }
@@ -143,12 +145,13 @@ class TransactionTracker {
 
   /**
    * Create a new tracked transaction in state RESERVED.
-   * @param {object} args { wallet, nonce }
+   * @param {object} args { wallet, nonce, mode?, relayId? }
    * @returns {object} read-only snapshot of the created record
    */
-  create({ wallet, nonce }) {
+  create({ wallet, nonce, mode, relayId }) {
     const n = this._validateNonce(nonce);
     const w = this._validateWallet(wallet);
+    const m = this._validateMode(mode);
     const now = Date.now();
     const id = `tx-${++this._seq}`;
     const rec = {
@@ -166,9 +169,35 @@ class TransactionTracker {
       receiptStatus: null,
       finalizedAt: null,
       lastError: null,
+      // TASK 4.5-D — submission context + replacement chain metadata.
+      mode: this._validateMode(mode),      // 'private' | 'public' | null
+      relayId: relayId || null,            // relay request id (NOT the tx hash)
+      replaces: null,                      // id of the transaction this one replaces
+      replacedBy: null,                    // id of the replacement transaction
     };
     this._records.set(id, rec);
     return this._clone(rec);
+  }
+
+  /**
+   * Wallet identity enforcement (TASK 4.5-D §27). When a wallet is provided it
+   * must match the record's owner (case-insensitive); otherwise the operation
+   * is rejected BEFORE any mutation.
+   */
+  _checkWallet(rec, wallet) {
+    if (wallet === undefined || wallet === null) return;
+    const addr = this._validateWallet(wallet);
+    if (rec.wallet !== addr) {
+      throw new Error(`tracker: wallet-mismatch (record owned by ${rec.wallet}, got ${addr})`);
+    }
+  }
+
+  _validateMode(mode) {
+    if (mode === undefined || mode === null) return null;
+    if (mode !== "private" && mode !== "public") {
+      throw new Error(`tracker: invalid mode (${String(mode)})`);
+    }
+    return mode;
   }
 
   /**
@@ -178,17 +207,24 @@ class TransactionTracker {
    * @param {string} txHash
    * @returns {object} read-only snapshot
    */
-  markSubmitted(id, txHash) {
+  markSubmitted(id, txHash, opts = {}) {
     const rec = this._getRecord(id);
+    // Wallet identity enforced BEFORE any mutation (TASK 4.5-D §27).
+    this._checkWallet(rec, opts.wallet);
+    const h = this._validateTxHash(txHash);
+    const m = this._validateMode(opts.mode);
     if (rec.state !== "RESERVED") {
       if (rec.state === "SUBMITTED" && rec.txHash === txHash) {
+        if (m !== null) rec.mode = m;
+        if (opts.relayId !== undefined) rec.relayId = opts.relayId || null;
         return this.transition(id, "SUBMITTED"); // idempotent
       }
       throw new Error(`tracker: illegal transition ${rec.state} -> SUBMITTED`);
     }
-    const h = this._validateTxHash(txHash);
     rec.txHash = h;
     rec.submittedAt = Date.now();
+    if (m !== null) rec.mode = m;
+    if (opts.relayId !== undefined) rec.relayId = opts.relayId || null;
     return this.transition(id, "SUBMITTED");
   }
 
@@ -196,10 +232,50 @@ class TransactionTracker {
    * Mark the transaction as mempool-visible.
    * SUBMITTED -> PENDING (also UNKNOWN -> PENDING; PENDING is idempotent).
    * @param {string} id
+   * @param {string} [wallet] — optional wallet identity check (case-insensitive)
    * @returns {object} read-only snapshot
    */
-  markPending(id) {
-    return this.transition(id, "PENDING");
+  markPending(id, wallet) {
+    return this.transition(id, "PENDING", {}, wallet);
+  }
+
+  /**
+   * TASK 4.5-D — replacement registration.
+   *
+   * Registers a replacement transaction (same wallet + same nonce, DIFFERENT
+   * txHash) without touching the original record's identity. The original and
+   * the replacement remain distinct records linked by explicit metadata:
+   *   new.replaces   = originalId
+   *   old.replacedBy = newId
+   *
+   * Safety rules:
+   *   - the original must NOT be terminal (a confirmed/reverted/dropped tx
+   *     cannot be replaced silently);
+   *   - the replacement goes through the REAL state machine
+   *     (create → RESERVED, then markSubmitted → SUBMITTED);
+   *   - atomic: all validation happens before any mutation (synchronous, no
+   *     awaits), so a throw can never leave half-registered metadata;
+   *   - replacing NEVER frees a nonce (the tracker never touches NonceManager).
+   *
+   * @param {string} id — original record id
+   * @param {object} opts { txHash, wallet?, relayId?, mode? }
+   * @returns {object} read-only snapshot of the NEW (replacement) record
+   */
+  replace(id, opts = {}) {
+    const old = this._getRecord(id);
+    this._checkWallet(old, opts.wallet);
+    if (old.state === "CONFIRMED" || old.state === "REVERTED" || old.state === "DROPPED") {
+      throw new Error(`tracker: cannot replace terminal transaction (${old.state})`);
+    }
+    // Validate EVERYTHING before any mutation (atomicity, TASK 4.5-D §25).
+    const h = this._validateTxHash(opts.txHash);
+    const m = this._validateMode(opts.mode);
+    const snap = this.create({ wallet: old.wallet, nonce: old.nonce, mode: m, relayId: opts.relayId });
+    const rec = this._records.get(snap.id);
+    rec.replaces = id;
+    this.markSubmitted(snap.id, h, { wallet: old.wallet, mode: m, relayId: opts.relayId });
+    old.replacedBy = snap.id;
+    return this._clone(this._records.get(snap.id));
   }
 /**
    * Poll the provider for the current transaction state and transition the
@@ -215,8 +291,10 @@ class TransactionTracker {
    * @param {object} provider { getTransactionReceipt, getTransaction }
    * @returns {object} read-only snapshot AFTER the poll
    */
-  async poll(id, provider) {
+  async poll(id, provider, wallet) {
     const rec = this._getRecord(id);
+    // Wallet identity (TASK 4.5-D §27) — enforced BEFORE any provider call.
+    this._checkWallet(rec, wallet);
     // Terminal states are immutable: never query, never regress, never throw on
     // RPC inconsistency. Idempotent poll keeps reporting the terminal state.
     if (rec.state === "CONFIRMED" || rec.state === "REVERTED" || rec.state === "DROPPED") {
