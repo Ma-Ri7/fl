@@ -9,7 +9,10 @@
 //   - wallet mismatch rejected (case-insensitive)
 //   - restart safety: a fresh manager must never reuse nonces the chain has
 //     already advanced past
-const { expect } = require("chai");
+const chai = require("chai");
+const chaiAsPromised = require("chai-as-promised");
+chai.use(chaiAsPromised);
+const { expect } = chai;
 const { NonceManager } = require("../../bot/nonce");
 
 const WALLET_ADDR = "0x70997970C51812dc3A010C7d01b50b0429c0d3c8";

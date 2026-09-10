@@ -6,7 +6,10 @@
 //
 // Receipt is the source of truth for finalization. poll() NEVER fabricates
 // DROPPED from a null transaction and never treats RPC errors as finality.
-const { expect } = require("chai");
+const chai = require("chai");
+const chaiAsPromised = require("chai-as-promised");
+chai.use(chaiAsPromised);
+const { expect } = chai;
 const { TransactionTracker } = require("../../bot/tx-tracker");
 
 const WALLET_A = "0x70997970C51812dc3A010C7d01b50b0429c0d3c8";
