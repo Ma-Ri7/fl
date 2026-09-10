@@ -657,3 +657,118 @@ describe("read-only API (get/list) + determinism", () => {
       expect(tracker.list({ state: "UNKNOWN" }).length).to.equal(1);
     });
   });
+describe("hardening — validation & terminal-state poll safety", () => {
+    // GAP-1 regression: nonce validation must be FAIL-CLOSED. Silently
+    // coercing null/empty-string/boolean to nonce 0 or 1 would record a
+    // WRONG nonce — exactly the class of accounting error the tracker must
+    // never make. These must be REJECTED, not accepted.
+    const badNonces = [
+      ["null", null],
+      ["undefined", undefined],
+      ["empty string", ""],
+      ["whitespace string", "   "],
+      ["true", true],
+      ["false", false],
+      ["empty array", []],
+    ];
+    for (const [label, value] of badNonces) {
+      it(`nonce ${label} is REJECTED at create (no silent coercion)`, () => {
+        const t = new TransactionTracker();
+        expect(() => t.create({ wallet: WALLET_A, nonce: value })).to.throw(/invalid nonce/);
+        expect(t.list().length).to.equal(0); // nothing recorded
+      });
+    }
+
+    it("valid numeric string nonce is still accepted", () => {
+      const t = new TransactionTracker();
+      const rec = t.create({ wallet: WALLET_A, nonce: "42" });
+      expect(t.get(rec.id).nonce).to.equal(42);
+    });
+
+    it("valid bigint nonce is still accepted", () => {
+      const t = new TransactionTracker();
+      const rec = t.create({ wallet: WALLET_A, nonce: 42n });
+      expect(t.get(rec.id).nonce).to.equal(42);
+    });
+
+    it("valid number nonce is still accepted", () => {
+      const t = new TransactionTracker();
+      const rec = t.create({ wallet: WALLET_A, nonce: 7 });
+      expect(t.get(rec.id).nonce).to.equal(7);
+    });
+
+    // GAP-2 regression: poll() on a TERMINAL record (e.g. CONFIRMED) whose
+    // provider momentarily cannot deliver a receipt (RPC hiccup / archive gap)
+    // must NOT throw an illegal-transition error and must NOT regress the
+    // state. It must idempotently keep reporting the terminal state.
+    it("poll on CONFIRMED with receipt=null + tx={} keeps CONFIRMED (no throw, no regress)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      await tracker.poll(id, makeProvider({ receipt: validReceipt(1, 100) }));
+      const p = makeProvider({ receipt: null, tx: {} });
+      let snap;
+      try {
+        snap = await tracker.poll(id, p);
+      } catch (e) {
+        expect.fail(`poll on CONFIRMED threw: ${e.message}`);
+      }
+      expect(snap.state).to.equal("CONFIRMED");
+      expect(tracker.get(id).state).to.equal("CONFIRMED");
+      expect(tracker.get(id).blockNumber).to.equal(100); // untouched
+    });
+
+    it("poll on CONFIRMED with receipt=null + tx=null keeps CONFIRMED (no UNKNOWN)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      await tracker.poll(id, makeProvider({ receipt: validReceipt(1, 100) }));
+      const p = makeProvider({ receipt: null, tx: null });
+      let snap;
+      try {
+        snap = await tracker.poll(id, p);
+      } catch (e) {
+        expect.fail(`poll on CONFIRMED threw: ${e.message}`);
+      }
+      expect(snap.state).to.equal("CONFIRMED");
+    });
+
+    it("poll on CONFIRMED with receipt RPC error keeps CONFIRMED (no throw, no UNKNOWN)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      await tracker.poll(id, makeProvider({ receipt: validReceipt(1, 100) }));
+      let snap;
+      try {
+        snap = await tracker.poll(id, makeProvider({ throwReceipt: true }));
+      } catch (e) {
+        expect.fail(`poll on CONFIRMED threw: ${e.message}`);
+      }
+      expect(snap.state).to.equal("CONFIRMED");
+    });
+
+    it("poll on REVERTED / DROPPED terminal records is also idempotent", async () => {
+      // REVERTED path
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      await tracker.poll(id, makeProvider({ receipt: validReceipt(0, 200) }));
+      let snap;
+      try {
+        snap = await tracker.poll(id, makeProvider({ receipt: null, tx: {} }));
+      } catch (e) {
+        expect.fail(`poll on REVERTED threw: ${e.message}`);
+      }
+      expect(snap.state).to.equal("REVERTED");
+
+      // DROPPED path
+      const t2 = new TransactionTracker();
+      const rec2 = t2.create({ wallet: WALLET_A, nonce: 3 });
+      t2.markSubmitted(rec2.id, "0x1111111111111111111111111111111111111111111111111111111111111111");
+      t2.markPending(rec2.id);
+      t2.transition(rec2.id, "DROPPED");
+      let s2;
+      try {
+        s2 = await t2.poll(rec2.id, makeProvider({ receipt: null, tx: {} }));
+      } catch (e) {
+        expect.fail(`poll on DROPPED threw: ${e.message}`);
+      }
+      expect(s2.state).to.equal("DROPPED");
+    });
+  });

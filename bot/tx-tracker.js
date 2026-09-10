@@ -24,8 +24,19 @@ class TransactionTracker {
   // -- validation helpers ----------------------------------------------------
 
   _validateNonce(nonce) {
+    if (nonce === null || nonce === undefined) {
+      throw new Error("tracker: invalid nonce (null/undefined)");
+    }
+    const type = typeof nonce;
+    if (type !== "number" && type !== "string" && type !== "bigint") {
+      // Rejects booleans, arrays, objects — never silently coerce to 0/1.
+      throw new Error(`tracker: invalid nonce (unexpected type ${type})`);
+    }
+    if (type === "string" && nonce.trim() === "") {
+      throw new Error("tracker: invalid nonce (empty string)");
+    }
     const n = Number(nonce);
-    if (!Number.isSafeInteger(n) || n < 0) {
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || !Number.isSafeInteger(n)) {
       throw new Error(`tracker: invalid nonce (${String(nonce)})`);
     }
     return n;
@@ -206,6 +217,11 @@ class TransactionTracker {
    */
   async poll(id, provider) {
     const rec = this._getRecord(id);
+    // Terminal states are immutable: never query, never regress, never throw on
+    // RPC inconsistency. Idempotent poll keeps reporting the terminal state.
+    if (rec.state === "CONFIRMED" || rec.state === "REVERTED" || rec.state === "DROPPED") {
+      return this._clone(rec);
+    }
     if (rec.state === "RESERVED" || rec.txHash == null) {
       throw new Error(`tracker: cannot poll without a txHash (state=${rec.state})`);
     }
