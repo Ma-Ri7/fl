@@ -155,8 +155,8 @@ async function main() {
   // ---------------------------------------------------- TEST 0: access control
   head("TEST 0 — ACCESS CONTROL pe fork real");
   const deadline0 = (await provider.getBlock("latest")).timestamp + 1200;
-  const legA0 = { kind: 1, target: PC_V3_POOL_F100, zeroForOne: true, path: [] };
-  const legB0 = { kind: 0, target: venue.router, zeroForOne: false, path: [WBNB, USDT] };
+  const legA0 = { kind: 1, target: PC_V3_POOL_F100, zeroForOne: true, path: [], minOut: 0n };
+  const legB0 = { kind: 0, target: venue.router, zeroForOne: false, path: [WBNB, USDT], minOut: 0n };
   let nonOwnerRejected = false;
   try {
     await arb.connect(other).flashArbitrage.staticCall(
@@ -188,8 +188,8 @@ async function main() {
 
   const amount0Out = usdtIsT0 ? A : 0n;
   const amount1Out = usdtIsT0 ? 0n : A;
-  const legA = { kind: 1, target: PC_V3_POOL_F100, zeroForOne: v3T0.toLowerCase() === USDT.toLowerCase(), path: [] };
-  const legB = { kind: 0, target: venue.router, zeroForOne: false, path: [WBNB, USDT] };
+  const legA = { kind: 1, target: PC_V3_POOL_F100, zeroForOne: v3T0.toLowerCase() === USDT.toLowerCase(), path: [], minOut: 0n };
+  const legB = { kind: 0, target: venue.router, zeroForOne: false, path: [WBNB, USDT], minOut: 0n };
   const dl = async () => (await provider.getBlock("latest")).timestamp + 600;
 
   async function ensureUsdt(need) {

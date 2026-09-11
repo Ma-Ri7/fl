@@ -67,7 +67,7 @@ async function latestDeadline(offsetSeconds = 300) {
 }
 
 function v2Leg(tokenIn, tokenOut, target) {
-  return { kind: LEG_V2, target, zeroForOne: false, path: [tokenIn, tokenOut] };
+  return { kind: LEG_V2, target, zeroForOne: false, path: [tokenIn, tokenOut], minOut: 0n };
 }
 
 // ============================================================================

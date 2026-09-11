@@ -592,4 +592,124 @@ describe("TASK 4.6-A — Economic execution safety", function () {
     });
   });
 
+  describe("TASK 4.6-B — per-leg minimum output & calldata", function () {
+    const { buildLeg, buildCalldata } = require("../../bot/executor");
+    const { ethers } = require("ethers");
+    const abi = require("../../artifacts/contracts/FlashLoanArbitrage.sol/FlashLoanArbitrage.json").abi;
+    const iface = new ethers.Interface(abi);
+
+    it("74. finalRequote exposes minOutA (derived from Leg A output)", function () {
+      const r = safety.finalRequote(makeV2Opp(), { slippageBps: 100n });
+      expect(r.slippage.minOutA).to.equal(safety.computeMinOut(r.final.baseRecv, 100n));
+      expect(typeof r.slippage.minOutA).to.equal("bigint");
+    });
+    it("75. finalRequote exposes minOutB (derived from Leg B output)", function () {
+      const r = safety.finalRequote(makeV2Opp(), { slippageBps: 100n });
+      expect(r.slippage.minOutB).to.equal(safety.computeMinOut(r.final.quoteRecv, 100n));
+      expect(typeof r.slippage.minOutB).to.equal("bigint");
+    });
+    it("76. minOutA <= baseRecv (conservative)", function () {
+      const r = safety.finalRequote(makeV2Opp(), { slippageBps: 100n });
+      expect(r.slippage.minOutA <= r.final.baseRecv).to.be.true;
+    });
+    it("77. minOutB <= quoteRecv (conservative)", function () {
+      const r = safety.finalRequote(makeV2Opp(), { slippageBps: 100n });
+      expect(r.slippage.minOutB <= r.final.quoteRecv).to.be.true;
+    });
+    it("78. zero slippage → minOutA == baseRecv, minOutB == quoteRecv", function () {
+      const r = safety.finalRequote(makeV2Opp(), { slippageBps: 0n });
+      expect(r.slippage.minOutA).to.equal(r.final.baseRecv);
+      expect(r.slippage.minOutB).to.equal(r.final.quoteRecv);
+    });
+    it("79. minOutA and minOutB are independent values", function () {
+      const r = safety.finalRequote(makeV2Opp(), { slippageBps: 100n });
+      expect(r.slippage.minOutA).to.not.equal(r.slippage.minOutB);
+    });
+    it("80. buildLeg threads minOut into a V2 leg tuple", function () {
+      const leg = buildLeg(v2Venue("0x" + "b2".repeat(20), tokWbnb, tokBase, 1_000_000n * E18, 1_000_000n * E18), tokWbnb.address, 12345n);
+      expect(leg.kind).to.equal(0);
+      expect(leg.minOut).to.equal(12345n);
+      expect(leg.path.length).to.equal(2);
+    });
+    it("81. buildLeg defaults minOut to 0n for V3/DODO (no per-leg floor)", function () {
+      expect(buildLeg(v3Venue(), T0).minOut).to.equal(0n);
+      expect(buildLeg(dodoVenue(), DODO_BASE).minOut).to.equal(0n);
+    });
+    it("82. buildCalldata (V2) encodes minOutA/minOutB into the leg tuples", function () {
+      const opp = makeV2Opp({ minOutA: 111n, minOutB: 222n, minProfit: 5n });
+      const { data } = buildCalldata(opp);
+      const decoded = iface.decodeFunctionData("flashArbitrage", data);
+      const legA = decoded[3]; // tuple
+      const legB = decoded[4];
+      expect(legA.minOut).to.equal(111n);
+      expect(legB.minOut).to.equal(222n);
+    });
+    it("83. buildCalldata (DODO) encodes minOut into the leg tuples", function () {
+      const d = dodoVenue();
+      const opp = {
+        sourceKind: "dodo",
+        borrowToken: { address: DODO_BASE }, baseToken: { address: DODO_QUOTE },
+        borrowAmount: 1000n * E18,
+        sourceVen: { kind: "dodo", pool: "0x" + "dd".repeat(20), baseToken: DODO_BASE, quoteToken: DODO_QUOTE },
+        buyVen: d, sellVen: d,
+        minOutA: 7n, minOutB: 8n, minProfit: 5n,
+      };
+      const { data } = buildCalldata(opp);
+      const decoded = iface.decodeFunctionData("flashArbitrageDodo", data);
+      // flashArbitrageDodo args: pool, baseAmt, quoteAmt, borrowToken, baseToken, baseTok, quoteTok, legA, legB, minProfit, deadline
+      const legA = decoded[7];
+      const legB = decoded[8];
+      expect(legA.minOut).to.equal(7n);
+      expect(legB.minOut).to.equal(8n);
+    });
+    it("84. no trivial amountOutMin=1: V2 leg minOut is the computed value, never 1", function () {
+      const r = safety.finalRequote(makeV2Opp(), { slippageBps: 100n });
+      expect(r.slippage.minOutB > 1n).to.be.true;
+    });
+    it("85. minOutA/minOutB are deterministic across calls", function () {
+      const a = safety.finalRequote(makeV2Opp(), { slippageBps: 100n });
+      const b = safety.finalRequote(makeV2Opp(), { slippageBps: 100n });
+      expect(a.slippage.minOutA).to.equal(b.slippage.minOutA);
+      expect(a.slippage.minOutB).to.equal(b.slippage.minOutB);
+    });
+  });
+
+
+  describe("TASK 4.6-B — slippage boundary values (§20)", function () {
+    it("86. 1 bps → minOut = floor(quote * 9999/10000)", function () {
+      expect(safety.computeMinOut(1000000n, 1n)).to.equal(999900n);
+      expect(safety.computeMinOut(10000n, 1n)).to.equal(9999n);
+    });
+    it("87. 50 bps → minOut = floor(quote * 9950/10000)", function () {
+      expect(safety.computeMinOut(1000000n, 50n)).to.equal(995000n);
+    });
+    it("88. very large BigInt quote (2^255) computes without overflow", function () {
+      const big = 1n << 255n;
+      const out = safety.computeMinOut(big, 100n);
+      expect(typeof out).to.equal("bigint");
+      expect(out).to.equal((big * 9900n) / 10000n);
+      expect(out <= big).to.be.true;
+    });
+    it("89. missing slippage → reject (not default)", function () {
+      // validateSlippageBps(undefined) must be null (fail-closed), never defaulted.
+      expect(safety.validateSlippageBps(undefined)).to.be.null;
+    });
+    it("90. invalid string slippage → reject", function () {
+      expect(safety.validateSlippageBps("abc")).to.be.null;
+    });
+    it("91. NaN slippage → reject", function () {
+      expect(safety.validateSlippageBps(NaN)).to.be.null;
+    });
+    it("92. Infinity slippage → reject", function () {
+      expect(safety.validateSlippageBps(Infinity)).to.be.null;
+    });
+    it("93. deterministic minOut across repeated calls (pure)", function () {
+      const q = 123456789n;
+      const a = safety.computeMinOut(q, 100n);
+      const b = safety.computeMinOut(q, 100n);
+      expect(a).to.equal(b);
+    });
+  });
+
+
 });

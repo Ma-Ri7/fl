@@ -153,6 +153,11 @@ contract FlashLoanArbitrage is Ownable, ReentrancyGuard {
         address target;
         bool zeroForOne;
         address[] path;
+        // Per-leg minimum acceptable output (TASK 4.6-B), derived off-chain from
+        // the FINAL fresh requote + slippage policy. Only meaningful for
+        // V2_ROUTER legs (swapExactTokensForTokens amountOutMin); V3/DODO legs
+        // carry 0 (they use sqrtPriceLimit / PMM settlement + atomic minProfit).
+        uint256 minOut;
     }
 
     // ---------------------------------------------------------------------
@@ -1267,7 +1272,9 @@ contract FlashLoanArbitrage is Ownable, ReentrancyGuard {
             ISwapRouter(leg_.target)
                 .swapExactTokensForTokens(
                     amountIn_,
-                    1,
+                    // Per-leg slippage guard (TASK 4.6-B): NOT a trivial "1".
+                    // Derived from the final fresh requote by the executor.
+                    leg_.minOut,
                     leg_.path,
                     address(this),
                     deadline_

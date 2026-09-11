@@ -422,9 +422,9 @@ describe("Test C: REAL DODO V2 fork integration", function () {
       p("expected DODO repayment   = " + fmt(repay) + " USDT");
 
       // Build real legs.
-      const legA = { kind: 1, target: PC_V3_POOL_F100, zeroForOne: true, path: [] };
+      const legA = { kind: 1, target: PC_V3_POOL_F100, zeroForOne: true, path: [], minOut: 0n };
       const venueRouterAddr = candRouterAddr(venue);
-      const legB = { kind: 0, target: venueRouterAddr, zeroForOne: false, path: [WBNB, USDT] };
+      const legB = { kind: 0, target: venueRouterAddr, zeroForOne: false, path: [WBNB, USDT], minOut: 0n };
       const dl = async () => (await provider.getBlock("latest")).timestamp + 300;
 
       const ownerUsdtBefore = BigInt(await usdt.balanceOf(owner.address));

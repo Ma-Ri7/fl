@@ -79,8 +79,8 @@ async function main() {
   const ownerBefore = await usdt.balanceOf(owner.address);
   const deadline = Math.floor(Date.now() / 1000) + 86400;
   // V3 pool: USDT (token0) -> WBNB (token1), so zeroForOne = true
-  const legA = { kind: 1, target: PC_V3_POOL_F100, zeroForOne: true, path: [] };
-  const legB = { kind: 0, target: BISWAP_ROUTER, zeroForOne: false, path: [WBNB, USDT] };
+  const legA = { kind: 1, target: PC_V3_POOL_F100, zeroForOne: true, path: [], minOut: 0n };
+  const legB = { kind: 0, target: BISWAP_ROUTER, zeroForOne: false, path: [WBNB, USDT], minOut: 0n };
 
   try {
     await flash.flashArbitrageDodo.staticCall(dvmAddr, 0n, borrow, USDT, WBNB, WBNB, USDT, legA, legB, 1n, deadline);

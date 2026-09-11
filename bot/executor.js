@@ -23,19 +23,20 @@ const logger = require("./logger");
 const iface = new ethers.Interface(abi);
 const DEADLINE_PAD = config.bot.deadlinePadSec || 75; // secunde
 
-function buildLeg(venue, tokenIn) {
+function buildLeg(venue, tokenIn, minOut = 0n) {
   const inIsA = tokenIn.toLowerCase() === venue.tokenA?.address?.toLowerCase();
   if (venue.kind === "v2") {
     const tA = venue.tokenA.address, tB = venue.tokenB.address;
     const path = inIsA ? [tA, tB] : [tB, tA];
-    return { kind: 0, target: venue.router, zeroForOne: false, path };
+    // minOut is the per-leg slippage floor (TASK 4.6-B) — NEVER a trivial "1".
+    return { kind: 0, target: venue.router, zeroForOne: false, path, minOut };
   }
   if (venue.kind === "v3") {
     const zeroForOne = tokenIn.toLowerCase() === venue.tokenA.address.toLowerCase();
-    return { kind: 1, target: venue.pool, zeroForOne, path: [] };
+    return { kind: 1, target: venue.pool, zeroForOne, path: [], minOut };
   }
   const zeroForOne = tokenIn.toLowerCase() === venue.baseToken.toLowerCase();
-  return { kind: 2, target: venue.pool, zeroForOne, path: [] };
+  return { kind: 2, target: venue.pool, zeroForOne, path: [], minOut };
 }
 
 /**
@@ -47,9 +48,13 @@ function buildCalldata(opp) {
   const minProfit = opp.minProfit;
   if (!(minProfit > 0n)) throw new Error("minProfit-must-be-positive");
 
+  // Per-leg slippage floors (TASK 4.6-B), derived from the FINAL requote.
+  const minOutA = opp.minOutA ?? 0n;
+  const minOutB = opp.minOutB ?? 0n;
+
   if (opp.sourceKind === "dodo") {
-    const legA = buildLeg(opp.buyVen, opp.borrowToken.address);
-    const legB = buildLeg(opp.sellVen, opp.baseToken.address);
+    const legA = buildLeg(opp.buyVen, opp.borrowToken.address, minOutA);
+    const legB = buildLeg(opp.sellVen, opp.baseToken.address, minOutB);
     const baseAmt = opp.borrowToken.address.toLowerCase() === opp.sourceVen.baseToken.toLowerCase() ? opp.borrowAmount : 0n;
     const quoteAmt = opp.borrowToken.address.toLowerCase() === opp.sourceVen.quoteToken.toLowerCase() ? opp.borrowAmount : 0n;
     return {
@@ -72,8 +77,8 @@ function buildCalldata(opp) {
   const bIsT0 = opp.borrowToken.address.toLowerCase() === opp.sourceVen.tokenA?.address?.toLowerCase();
   const amount0Out = bIsT0 ? opp.borrowAmount : 0n;
   const amount1Out = bIsT0 ? 0n : opp.borrowAmount;
-  const legA = buildLeg(opp.buyVen, opp.borrowToken.address);
-  const legB = buildLeg(opp.sellVen, opp.baseToken.address);
+  const legA = buildLeg(opp.buyVen, opp.borrowToken.address, minOutA);
+  const legB = buildLeg(opp.sellVen, opp.baseToken.address, minOutB);
   return {
     sig: "v2",
     data: iface.encodeFunctionData("flashArbitrage", [
@@ -186,6 +191,8 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     flashFee: fq.final.flashFee,
     netProfit: fq.final.net,
     minProfit: fq.final.minProfit,
+    minOutA: fq.slippage.minOutA,
+    minOutB: fq.slippage.minOutB,
   };
   const { data, sig } = buildCalldata(fresh);
   const fn = sig === "dodo" ? "flashArbitrageDodo" : "flashArbitrage";

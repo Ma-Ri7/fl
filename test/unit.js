@@ -124,6 +124,7 @@ function v2Leg(tokenIn, tokenOut, target) {
     target,
     zeroForOne: false,
     path: [tokenIn, tokenOut],
+    minOut: 0n, // TASK 4.6-B: per-leg slippage floor (0 = no floor in these unit fixtures)
   };
 }
 
@@ -133,6 +134,7 @@ function v3Leg(target, zeroForOne) {
     target,
     zeroForOne,
     path: [],
+    minOut: 0n, // TASK 4.6-B: V3 uses sqrtPriceLimit, minOut unused
   };
 }
 
@@ -377,6 +379,7 @@ describe("FlashLoanArbitrage — unit/security suite", function () {
         target: await buyDex.getAddress(),
         zeroForOne: false,
         path: [tokAddr, usdtAddr],
+        minOut: 0n,
       };
 
       const legB = v2Leg(
@@ -529,6 +532,7 @@ describe("FlashLoanArbitrage — unit/security suite", function () {
         target: await buyDex.getAddress(),
         zeroForOne: false,
         path: [],
+        minOut: 0n,
       };
 
       const legB = {
@@ -539,6 +543,7 @@ describe("FlashLoanArbitrage — unit/security suite", function () {
           await tok.getAddress(),
           usdtAddr,
         ],
+        minOut: 0n,
       };
 
       await expect(

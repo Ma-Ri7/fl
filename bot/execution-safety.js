@@ -111,7 +111,10 @@ function finalRequote(opp, opts = {}) {
     return reject(REJECTION_CODES.INVALID_SLIPPAGE, "invalid slippageBps");
   }
 
-  const minOut = computeMinOut(quoteRecv, slippageBps);
+  // Per-leg minimum outputs (TASK 4.6-B): each derived from the FINAL requote.
+  // minOutA guards Leg A output (baseRecv); minOutB guards Leg B output (quoteRecv).
+  const minOutA = computeMinOut(baseRecv, slippageBps);
+  const minOutB = computeMinOut(quoteRecv, slippageBps);
   const margin = (quoteRecv * slippageBps) / BPS_DENOMINATOR;
   const minProfit = net > margin ? net - margin : 0n;
 
@@ -125,7 +128,7 @@ function finalRequote(opp, opts = {}) {
       profitInBnb: toBigIntOrNull(opp.profitInBnb),
     },
     final: { baseRecv, quoteRecv, flashFee, net, minProfit },
-    slippage: { bps: slippageBps, minOut, margin },
+    slippage: { bps: slippageBps, minOutA, minOutB, minOut: minOutB, margin },
     economics: { flashFee, net, minProfit },
     rejection: null,
   };
