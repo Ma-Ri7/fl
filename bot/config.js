@@ -161,6 +161,8 @@ module.exports = {
     // PHASE 10/11 — execuție:
     requoteMaxAgeBlocks: 2, // final requote mai vechi de N block-uri => skip
     gasReserveBps: 500, // profit net (în BNB) trebuie să depășească gas estimat cu 5%
+    gasBufferBps: 2000, // TASK 4.6-C: gasLimit = ceil(estimate * (10000+bps)/10000) — 20% headroom
+    maxGasLimit: 5000000, // TASK 4.6-C: plafon de siguranță — << block gas limit BSC (140M), >> uzual 2-leg arb (~0.5-1M)
     deadlinePadSec: 75, // deadline scurt (~3 blocuri BSC), nu 5 minute
   },
 };

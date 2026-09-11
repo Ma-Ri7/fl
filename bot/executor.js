@@ -18,6 +18,7 @@ const { TransactionTracker } = require("./tx-tracker");
 const scanner = require("./scanner");
 const profit = require("./profit");
 const executionSafety = require("./execution-safety");
+const executionCost = require("./execution-cost");
 const logger = require("./logger");
 
 const iface = new ethers.Interface(abi);
@@ -167,18 +168,29 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     return { ok: false, reason: guard.rejection.code, details: guard.rejection.reason };
   }
 
-  // ---- 2. GAS / COST ECONOMICS (PHASE 7 — minim viabil) ---------------------
+  // ---- 2. GAS / COST ECONOMICS — VALIDAREA FEE DATA (TASK 4.6-C) ------------
   const minProfitBnb = ethers.parseEther(String(config.bot.minProfitBnb));
   const price = profit.tokenPriceInBnb(opp.borrowToken.address, [opp.buyVen, opp.sellVen]);
-  if (price.num <= 0n) return { ok: false, reason: "no-bnb-price" };
+  if (price.num <= 0n || price.den <= 0n) {
+    return { ok: false, reason: "PROFIT_CONVERSION_UNAVAILABLE", details: "no verified token→BNB conversion" };
+  }
   const netInBnb = (fq.final.net * price.num) / price.den;
   if (netInBnb < minProfitBnb) {
     return { ok: false, reason: "below-min-profit-bnb" };
   }
+  // TASK 4.6-C — fee data validat FAIL-CLOSED: lipsă/malformed => REJECT
+  // (niciodată default-ul vechi „|| 5 gwei" care masca un provider stricat).
+  // Worst-case bound = max(gasPrice legacy, maxFeePerGas EIP-1559). ACEEAȘI
+  // valoare validată este folosită în modelul de cost ȘI în parametrii tx.
   const feeData = await provider.getFeeData();
-  const gasPrice = feeData.gasPrice || 5000000000n;
-  // plafon de gas al unui flashloan cu 2 legs (mecanism, nu calcul exact);
-  // estimateGas real vine după simulare și este folosit la re-verificare.
+  const fee = executionCost.worstCaseGasPriceWei(feeData);
+  if (!fee.ok) {
+    return { ok: false, reason: fee.rejection.code, details: fee.rejection.reason };
+  }
+  const gasPrice = fee.priceWei;
+  // Pre-filtru grosier cu plafon mecanic (500k gas) al unui flashloan cu 2
+  // legs. VERDICTUL REAL se dă la pasul 5, pe estimateGas real, cu același
+  // model validat din bot/execution-cost.js (4.6-C).
   const gasFloor = 500000n * gasPrice;
   if (netInBnb <= (gasFloor * (10000n + BigInt(config.bot.gasReserveBps))) / 10000n) {
     return { ok: false, reason: "profit-below-gas-floor" };
@@ -215,18 +227,37 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     return { ok: false, reason: "sim-fail", err: e.message.slice(0, 120) };
   }
 
-  // ---- 5. ESTIMARE GAS REAL + reverificare economie -------------------------
-  let gasLimit;
+  // ---- 5. ESTIMARE GAS REAL + EXECUTION-COST GUARD (TASK 4.6-C) -------------
+  // estimateGas failure/malformed => REJECT (fail-closed; niciodată un default
+  // de genul „gas = 500k"). Buffer și plafon formalizate în bot/execution-cost.js
+  // (bps întregi, ceil conservator, ceiling config). Costul folosește worst-case
+  // bound-ul fee data (max(gasPrice, maxFeePerGas)), NU effectiveGasPrice
+  // (necunoscut pre-execuție). Verdict final: net = gross(token→BNB) - gasCost,
+  // verificat contra minProfitBnb și gasReserveBps cu aritmetică BigInt.
+  let gasEstimate;
   try {
-    gasLimit = await contract[fn].estimateGas(...parseCalldata(fn, data));
+    gasEstimate = await contract[fn].estimateGas(...parseCalldata(fn, data));
   } catch (e) {
-    return { ok: false, reason: "gas-est-fail", err: e.message.slice(0, 120) };
+    return { ok: false, reason: "GAS_ESTIMATE_FAILED", err: e.message.slice(0, 120) };
   }
-  gasLimit = (gasLimit * 120n) / 100n; // 20% buffer
-  const gasCostBnb = gasLimit * gasPrice;
-  if (netInBnb <= (gasCostBnb * (10000n + BigInt(config.bot.gasReserveBps))) / 10000n) {
-    return { ok: false, reason: "profit-below-gas", gasCostBnb, netInBnb };
+  const cost = executionCost.evaluateExecutionCost({
+    profitRaw: fq.final.net,
+    settlementToken: opp.borrowToken.address,
+    gasEstimate,
+    feeData,
+    priceBnb: price,
+    policy: {
+      minProfitBnb,
+      gasReserveBps: BigInt(config.bot.gasReserveBps),
+      bufferBps: config.bot.gasBufferBps,
+      maxGasLimit: config.bot.maxGasLimit,
+    },
+  });
+  if (!cost.ok) {
+    return { ok: false, reason: cost.rejection.code, details: cost.rejection.reason,
+             costWei: cost.costWei, netBnb: cost.netBnb };
   }
+  const gasLimit = cost.gasLimit;
 
   // ---- 6. NONCE RESERVATION (PHASE 11) --------------------------------------
   // TASK 4.2-B — contractul de dependency injection:
@@ -292,15 +323,22 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
   };
 
   // ---- 7. SUBMISIE (privat cu fallback SIGUR) -------------------------------
+  // TASK 4.6-C AUDIT FIX (F1/F2): parametrii de fee către relay sunt derivați
+  // DIN BOUND-UL VALIDAT, nu din feeData raw. Astfel gar price == submitted
+  // bound garantat: un maxFeePerGas/malformed din feeData nu poate ocoli
+  // economic guard-ul ajungând semnat în tranzacție. Tip-ul este sanitizat la
+  // un BigInt valid ≤ bound (EIP-1559 plafonează oricum efectiv la maxFeePerGas).
   const useBloxroute = await bloxroute.isAvailable();
   if (useBloxroute) {
+    const priorityRaw = executionCost.validateGasUnits(feeData.maxPriorityFeePerGas);
+    const priorityTip = priorityRaw !== null && priorityRaw > 0n && priorityRaw <= fee.priceWei ? priorityRaw : 0n;
     const result = await bloxroute.sendPrivateTx({
       wallet,
       to: contractAddr,
       data,
       gasLimit,
-      maxFeePerGas: feeData.maxFeePerGas || 5000000000n,
-      maxPriorityFeePerGas: feeData.maxPriorityFeePerGas || 2000000000n,
+      maxFeePerGas: fee.priceWei, // bound-ul worst-case VALIDAT (audit F1)
+      maxPriorityFeePerGas: priorityTip, // sanitizat, ≤ bound (audit F2)
       targetBlock: opts.targetBlock,
       nonce,
     });
