@@ -17,7 +17,7 @@ const { NonceManager } = require("./nonce");
 const { TransactionTracker } = require("./tx-tracker");
 const scanner = require("./scanner");
 const profit = require("./profit");
-const dodo = require("../lib/dodo");
+const executionSafety = require("./execution-safety");
 const logger = require("./logger");
 
 const iface = new ethers.Interface(abi);
@@ -111,8 +111,8 @@ async function simulate(contractAddr, calldata, sig, provider) {
 /**
  * PHASE 10 — FINAL REQUOTE:
  * recitește starea PROASPĂTĂ (block nou) doar a venue-urilor implicate și
- * recalculează output-ul, flash fee-ul și profitul net exact.
- * @returns {null | {blockNumber, baseRecv, quoteRecv, flashFee, net, minProfit}}
+ * recalculează output-ul, flash fee-ul, slippage minOut și profitul net exact.
+ * @returns {null | {blockNumber, ok, borrow, expected, final, slippage, economics, rejection}}
  */
 async function finalRequote(provider, opp, opts = {}) {
   const venues = [opp.buyVen, opp.sellVen];
@@ -122,20 +122,11 @@ async function finalRequote(provider, opp, opts = {}) {
   await scanner.readState(provider, live, { trader: opts.trader });
   const blockNumber = await provider.getBlockNumber();
 
-  const borrow = opp.borrowAmount;
-  const baseRecv = profit.venueOutput(opp.buyVen, opp.borrowToken.address, borrow);
-  if (!(baseRecv > 0n)) return null;
-  const quoteRecv = profit.venueOutput(opp.sellVen, opp.baseToken.address, baseRecv);
-  if (!(quoteRecv > borrow)) return null;
-  const flashFee = opp.sourceKind === "dodo"
-    ? dodo.dodoFlashFee(borrow, config.dodo)
-    : (borrow * 25n) / 10000n;
-  const net = quoteRecv - borrow - flashFee;
-  // Marja de risc se aplică pe quote-ul EXACT (config.bot.slippageBps).
-  // NU este un procent arbitrar "de contract" — e marja off-chain declarată.
-  const margin = (quoteRecv * BigInt(config.bot.slippageBps)) / 10000n;
-  const minProfit = net > margin ? net - margin : 0n;
-  return { blockNumber, baseRecv, quoteRecv, flashFee, net, minProfit };
+  // TASK 4.6-A: delegăm calculele economice la modulul PUR (execution-safety),
+  // care recalculează ambele legs + flash fee + slippage minOut + minProfit
+  // determinist, fără floating point, pe state-ul fresh citit mai sus.
+  const r = executionSafety.finalRequote(opp, { slippageBps: opts.slippageBps });
+  return { blockNumber, ...r };
 }
 
 /**
@@ -154,20 +145,28 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     return { ok: false, reason: "requote-fail", err: e.message.slice(0, 120) };
   }
   if (!fq) return { ok: false, reason: "requote-empty" };
+  if (fq.ok !== true) {
+    return { ok: false, reason: fq.rejection ? fq.rejection.code : "requote-failed" };
+  }
 
   const age = opp.snapshot ? fq.blockNumber - opp.snapshot.blockNumber : 0;
   if (age > config.bot.requoteMaxAgeBlocks) {
     return { ok: false, reason: "stale-opportunity", age };
   }
-  if (!(fq.minProfit > 0n)) {
-    return { ok: false, reason: "no-profit-after-requote" };
+
+  // TASK 4.6-A — ECONOMIC GUARD: slippage + min-output + min-profit (fail-closed).
+  const guard = executionSafety.validateExecutionEconomics(fq, {
+    slippageBps: config.bot.slippageBps,
+  });
+  if (!guard.ok) {
+    return { ok: false, reason: guard.rejection.code, details: guard.rejection.reason };
   }
 
   // ---- 2. GAS / COST ECONOMICS (PHASE 7 — minim viabil) ---------------------
   const minProfitBnb = ethers.parseEther(String(config.bot.minProfitBnb));
   const price = profit.tokenPriceInBnb(opp.borrowToken.address, [opp.buyVen, opp.sellVen]);
   if (price.num <= 0n) return { ok: false, reason: "no-bnb-price" };
-  const netInBnb = (fq.net * price.num) / price.den;
+  const netInBnb = (fq.final.net * price.num) / price.den;
   if (netInBnb < minProfitBnb) {
     return { ok: false, reason: "below-min-profit-bnb" };
   }
@@ -182,11 +181,11 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
 
   const fresh = {
     ...opp,
-    baseRecv: fq.baseRecv,
-    quoteRecv: fq.quoteRecv,
-    flashFee: fq.flashFee,
-    netProfit: fq.net,
-    minProfit: fq.minProfit,
+    baseRecv: fq.final.baseRecv,
+    quoteRecv: fq.final.quoteRecv,
+    flashFee: fq.final.flashFee,
+    netProfit: fq.final.net,
+    minProfit: fq.final.minProfit,
   };
   const { data, sig } = buildCalldata(fresh);
   const fn = sig === "dodo" ? "flashArbitrageDodo" : "flashArbitrage";
@@ -196,7 +195,7 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
   if (opts.shadow) {
     try {
       await contract[fn].staticCall(...parseCalldata(fn, data));
-      return { ok: true, shadow: true, estProfit: fq.net, minProfit: fq.minProfit, netInBnb };
+      return { ok: true, shadow: true, estProfit: fq.final.net, minProfit: fq.final.minProfit, netInBnb };
     } catch (e) {
       return { ok: false, shadow: true, reason: "shadow-sim-fail", err: e.message.slice(0, 120) };
     }
@@ -319,7 +318,7 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
         // NEVER rollback. Return explicit failure.
         return { ok: false, reason: "nonce-commit-failed", nonce, txHash: result.txHash, private: true, err: e.message };
       }
-      return { ok: true, txHash: result.txHash, blockNumber: result.block, profit: fq.net, minProfit: fq.minProfit, private: true, nonce, trackerId: recId };
+      return { ok: true, txHash: result.txHash, blockNumber: result.block, profit: fq.final.net, minProfit: fq.final.minProfit, private: true, nonce, trackerId: recId };
     }
     if (result.status === "unknown") {
       // Private submission UNKNOWN — no txHash, but nonce may still be used.
@@ -359,7 +358,7 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
       // NEVER rollback. Return explicit failure.
       return { ok: false, reason: "nonce-commit-failed", nonce, txHash: tx.hash, private: false, err: e.message };
     }
-    return { ok: true, txHash: tx.hash, profit: fq.net, minProfit: fq.minProfit, private: false, nonce, trackerId: recId };
+    return { ok: true, txHash: tx.hash, profit: fq.final.net, minProfit: fq.final.minProfit, private: false, nonce, trackerId: recId };
   } catch (e) {
     // Broadcast failure BEFORE txHash exists — rollback is safe (semantica
     // acceptată în 4.5-A). Tracker: submission attempt recorded as UNKNOWN
