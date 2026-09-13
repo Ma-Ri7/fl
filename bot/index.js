@@ -147,20 +147,31 @@ async function main(deps = {}) {
           );
           if (result.ok) {
             totalTx++;
-            logger.info(`SUCCESS tx=${result.txHash} block=${result.blockNumber} profit=${fmtTok(best.netProfit, best.borrowToken.decimals || 18)} ${best.borrowToken.symbol || ""} (~${fmtTok(best.profitInBnb, 18)} BNB)`);
-
-            // Tracker: follow tx to receipt and compute real P&L
-            if (result.txHash) {
-              const tracked = await trackTx(provider, {
-                txHash: result.txHash,
-                timeoutMs: config.bot.maxTxWaitMs || 120000,
-              });
+            // TASK 4.7 (INVARIANT 1/5/6): broadcast acknowledgement ≠ on-chain
+            // confirmation. Aici există doar SUBMISIE (txHash cunoscut) —
+            // niciodată "SUCCESS". Rezultatul real (mined/reverted/timeout/
+            // unknown) vine EXCLUSIV din receipt-ul verificat de trackTx.
+            logger.info(`SUBMITTED tx=${result.txHash} (expected profit=${fmtTok(best.netProfit, best.borrowToken.decimals || 18)} ${best.borrowToken.symbol || ""} — așteptăm receipt-ul real)`);
+            const { trackTransaction: trackTxFn } = require("./tracker");
+            const trackTxLocal = deps.trackTransaction || trackTxFn;
+            const tracked = await trackTxLocal(provider, {
+              txHash: result.txHash,
+              timeoutMs: config.bot.maxTxWaitMs || 120000,
+              expectedChainId: config.chainId,
+            });
+            if (tracked.status === "mined") {
+              // Doar receipt status 1 (identitate + lanț verificate) = succes.
+              logger.info(`CONFIRMED_SUCCESS tx=${tracked.txHash} block=${tracked.blockNumber}`);
               if (tracked.realizedProfit != null) {
                 logger.info(`[tracker] realized profit = ${fmtTok(tracked.realizedProfit, 18)} BNB`);
               }
               if (tracked.gasCostBnb != null) {
                 logger.info(`[tracker] gas cost = ${Number(tracked.gasCostBnb) / 1e18} BNB`);
               }
+            } else {
+              // reverted / timeout / unknown — niciodată clasificate ca succes.
+              logger.warn(`[tracker] outcome=${tracked.status} tx=${tracked.txHash} (NICIODATĂ tratat ca success)` +
+                (tracked.lastError ? ` lastError=${tracked.lastError.slice(0, 80)}` : ""));
             }
           } else {
             logger.warn(`Execute failed: ${result.reason} - ${result.err?.slice(0, 80)}`);

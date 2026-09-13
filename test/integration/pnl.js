@@ -473,4 +473,99 @@ describe("TASK 4.5-E — Realized P&L Tracker", function () {
       expect(reconstructed).to.equal(r.afterBalanceRaw);
     });
   });
+
+  describe("TASK 4.7 — receipt identity binding (INVARIANT 7)", function () {
+    const TXH = TX_HASH_1;
+    const OTHER = TX_HASH_2;
+
+    it("4.7-P1 — receipt transactionHash matching the recorded txHash → accepted", function () {
+      const r = tracker.recordPnL(baseData({
+        receipt: confirmedReceipt({ transactionHash: TXH }),
+      }));
+      expect(r.grossProfitStatus).to.equal(PnLStatus.REALIZED);
+      expect(tracker.listPnL().length).to.equal(1);
+    });
+
+    it("4.7-P2 — receipt transactionHash MISMATCH → rejected, NO record (foreign receipt)", function () {
+      let err = null;
+      try {
+        tracker.recordPnL(baseData({ receipt: confirmedReceipt({ transactionHash: OTHER }) }));
+      } catch (e) { err = e; }
+      expect(err).to.exist;
+      expect(err.message).to.include("receipt hash mismatch");
+      // Fail-closed: nicio înregistrare P&L nu poate fi creată dintr-un receipt străin.
+      expect(tracker.listPnL().length).to.equal(0);
+    });
+
+    it("4.7-P3 — receipt transactionHash malformed → rejected (fail-closed)", function () {
+      let err = null;
+      try {
+        tracker.recordPnL(baseData({ receipt: confirmedReceipt({ transactionHash: "bundle-123-not-a-hash" }) }));
+      } catch (e) { err = e; }
+      expect(err).to.exist;
+      expect(err.message).to.include("invalid receipt.transactionHash");
+      expect(tracker.listPnL().length).to.equal(0);
+    });
+
+    it("4.7-P4 — receipt transactionHash case-insensitive match → accepted", function () {
+      const r = tracker.recordPnL(baseData({
+        receipt: confirmedReceipt({ transactionHash: TXH.toUpperCase() }),
+      }));
+      expect(r.grossProfitStatus).to.equal(PnLStatus.REALIZED);
+    });
+
+    it("4.7-P5 — REVERTED receipt with matching hash → NO realized gross profit (revert ≠ success)", function () {
+      const r = tracker.recordPnL(baseData({
+        receipt: { status: 0, gasUsed: 200000n, effectiveGasPrice: 3000000000n, blockNumber: 100, blockHash: BLOCK_HASH, transactionHash: TXH },
+      }));
+      expect(r.grossProfitStatus).to.not.equal(PnLStatus.REALIZED);
+      expect(r.grossProfitRaw).to.equal(null);
+      expect(r.isReverted).to.equal(true);
+    });
+  });
+
+  describe("TASK 4.7-R — PnL safety: no realized profit before confirmed success (section 11/20-22)", function () {
+    const TXH = TX_HASH_1;
+    const OTHER = TX_HASH_2;
+
+    it("R.20 — PENDING (no receipt) does NOT create realized PnL", function () {
+      // Fără receipt, recordPnL nu poate demonstra succes => niciun profit realizat.
+      const r = tracker.recordPnL(baseData({ receipt: null }));
+      expect(r.grossProfitStatus).to.not.equal(PnLStatus.REALIZED);
+      expect(r.grossProfitRaw).to.equal(null);
+      expect(r.status).to.equal(PnLStatus.UNKNOWN);
+    });
+
+    it("R.21 — CONFIRMED_REVERT (status 0) does NOT create realized gross PnL", function () {
+      const r = tracker.recordPnL(baseData({
+        receipt: { status: 0, gasUsed: 200000n, effectiveGasPrice: 3000000000n, blockNumber: 100, blockHash: BLOCK_HASH, transactionHash: TXH },
+      }));
+      expect(r.grossProfitStatus).to.not.equal(PnLStatus.REALIZED);
+      expect(r.grossProfitRaw).to.equal(null);
+      expect(r.isReverted).to.equal(true);
+      // Dar costul real de gas (consumat de revert) ESTE capturat.
+      expect(r.gasCostWei).to.equal(200000n * 3000000000n);
+    });
+
+    it("R.22 — CONFIRMED_SUCCESS creates realized PnL EXACTLY ONCE (idempotent)", function () {
+      const data = baseData({ receipt: confirmedReceipt({ transactionHash: TXH }) });
+      const r1 = tracker.recordPnL(data);
+      const r2 = tracker.recordPnL(data); // duplicate txHash
+      expect(r1.grossProfitStatus).to.equal(PnLStatus.REALIZED);
+      expect(r1.grossProfitRaw).to.equal(12500n);
+      // Idempotency: a doua înregistrare returnează ACELAȘI record, nu unul nou.
+      expect(r2.id).to.equal(r1.id);
+      expect(tracker.listPnL().length).to.equal(1);
+    });
+
+    it("R.23 — foreign receipt is rejected → NO PnL record created (INVARIANT 7)", function () {
+      let err = null;
+      try {
+        tracker.recordPnL(baseData({ receipt: confirmedReceipt({ transactionHash: OTHER }) }));
+      } catch (e) { err = e; }
+      expect(err).to.exist;
+      expect(err.message).to.include("receipt hash mismatch");
+      expect(tracker.listPnL().length).to.equal(0);
+    });
+  });
 });

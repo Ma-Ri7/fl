@@ -19,14 +19,19 @@ const BLOCK_HASH = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefde
 
 // Scripted provider: per-hash receipt and transaction responses, plus an
 // optional per-method throw to simulate transient RPC failure.
+// TASK 4.7: optional `network` (chainId) + `throwNetwork` for chain-identity
+// simulation (INVARIANT 8).
 function makeProvider(opts = {}) {
   const p = {
     receipt: opts.receipt,           // value or null
     tx: opts.tx,                     // value or null
     throwReceipt: !!opts.throwReceipt,
     throwTx: !!opts.throwTx,
+    network: opts.network,           // { chainId } value or undefined
+    throwNetwork: !!opts.throwNetwork,
     receiptCalls: 0,
     txCalls: 0,
+    networkCalls: 0,
     async getTransactionReceipt(hash) {
       p.receiptCalls += 1;
       if (p.throwReceipt) throw new Error("RPC failure: receipt");
@@ -36,6 +41,11 @@ function makeProvider(opts = {}) {
       p.txCalls += 1;
       if (p.throwTx) throw new Error("RPC failure: tx");
       return p.tx;
+    },
+    async getNetwork() {
+      p.networkCalls += 1;
+      if (p.throwNetwork) throw new Error("RPC failure: network");
+      return p.network;
     },
   };
   return p;
@@ -285,12 +295,14 @@ describe("C — PENDING", () => {
     });
   });
 describe("F — UNKNOWN (fail-closed)", () => {
-    it("24 — transaction null + receipt null → UNKNOWN", async () => {
+    it("24 — receipt null → PENDING (TASK 4.7-R: no receipt ≠ UNKNOWN)", async () => {
       const { tracker, id } = await makeSubmittedTracker();
       tracker.markPending(id);
       const provider = makeProvider({ receipt: null, tx: null });
       const snap = await tracker.poll(id, provider);
-      expect(snap.state).to.equal("UNKNOWN");
+      // receipt === null = cunoaștere POZITIVĂ (nu minată încă) => PENDING,
+      // atâta timp cât nu există dovezi pentru altă stare.
+      expect(snap.state).to.equal("PENDING");
     });
 
     it("25 — receipt RPC error → UNKNOWN with lastError", async () => {
@@ -302,40 +314,48 @@ describe("F — UNKNOWN (fail-closed)", () => {
       expect(snap.lastError).to.include("receipt RPC error");
     });
 
-    it("26 — transaction RPC error → UNKNOWN with lastError", async () => {
+    it("26 — mempool lookup unavailable + receipt null → PENDING (TASK 4.7-R: mempool invisibility is not evidence)", async () => {
+      // TASK 4.7-R: poll() nu mai consultă mempool-ul pentru clasificare.
+      // receipt === null stabilește „nu a fost minată” — vizibilitatea în
+      // mempool (sau erorea RPC a ei) nu contrazice PENDING, mai ales pentru
+      // submissions private, care sunt invizibile by design (4.5-D).
       const { tracker, id } = await makeSubmittedTracker();
       tracker.markPending(id);
       const provider = makeProvider({ receipt: null, throwTx: true });
       const snap = await tracker.poll(id, provider);
-      expect(snap.state).to.equal("UNKNOWN");
-      expect(snap.lastError).to.include("tx RPC error");
+      expect(snap.state).to.equal("PENDING");
+      expect(snap.state).to.not.equal("UNKNOWN");
     });
 
-    it("27 — UNKNOWN preserves lastError", async () => {
+    it("27 — UNKNOWN preserves lastError; PENDING clears it (TASK 4.7-R)", async () => {
       const { tracker, id } = await makeSubmittedTracker();
       tracker.markPending(id);
-      const provider = makeProvider({ receipt: null, tx: null });
-      await tracker.poll(id, provider);
+      // RPC error → UNKNOWN cu lastError.
+      await tracker.poll(id, makeProvider({ throwReceipt: true }));
       expect(tracker.get(id).lastError).to.not.equal(null);
+      // Recuperare: receipt null → PENDING; lastError-ul învechit se curăță.
+      await tracker.poll(id, makeProvider({ receipt: null }));
+      expect(tracker.get(id).state).to.equal("PENDING");
+      expect(tracker.get(id).lastError).to.equal(null);
     });
   });
 
   describe("G — UNKNOWN != DROPPED", () => {
-    it("28 — null receipt + null tx → UNKNOWN, NEVER DROPPED", async () => {
+    it("28 — receipt null → PENDING, NEVER DROPPED (TASK 4.7-R)", async () => {
       const { tracker, id } = await makeSubmittedTracker();
       tracker.markPending(id);
       const provider = makeProvider({ receipt: null, tx: null });
       await tracker.poll(id, provider);
-      expect(tracker.get(id).state).to.equal("UNKNOWN");
+      expect(tracker.get(id).state).to.equal("PENDING");
       expect(tracker.get(id).state).to.not.equal("DROPPED");
     });
 
-    it("29 — poll never produces DROPPED even after repeated null polls", async () => {
+    it("29 — poll never produces DROPPED even after repeated null polls (stays PENDING)", async () => {
       const { tracker, id } = await makeSubmittedTracker();
       tracker.markPending(id);
       const provider = makeProvider({ receipt: null, tx: null });
       for (let i = 0; i < 5; i++) await tracker.poll(id, provider);
-      expect(tracker.get(id).state).to.equal("UNKNOWN");
+      expect(tracker.get(id).state).to.equal("PENDING");
       expect(tracker.get(id).state).to.not.equal("DROPPED");
     });
 
@@ -448,10 +468,12 @@ describe("J — idempotency", () => {
       expect(tracker.get(id).blockNumber).to.equal(50);
     });
 
-    it("42 — UNKNOWN → UNKNOWN no-op", async () => {
+    it("42 — UNKNOWN → UNKNOWN no-op (via receipt RPC error)", async () => {
       const { tracker, id } = await makeSubmittedTracker();
       tracker.markPending(id);
-      const provider = makeProvider({ receipt: null, tx: null });
+      // TASK 4.7-R: UNKNOWN se atinge acum doar prin incertitudine reală
+      // (ex: RPC error), nu prin receipt null (care => PENDING).
+      const provider = makeProvider({ throwReceipt: true });
       await tracker.poll(id, provider);
       await tracker.poll(id, provider);
       expect(tracker.get(id).state).to.equal("UNKNOWN");
@@ -577,11 +599,11 @@ describe("L — data integrity & false positives", () => {
       expect(tracker.get(id).state).to.not.equal("CONFIRMED");
     });
 
-    it("55 — RPC tx error is NEVER DROPPED", async () => {
+    it("55 — receipt null (mempool unavailable or not) is NEVER DROPPED — stays PENDING (TASK 4.7-R)", async () => {
       const { tracker, id } = await makeSubmittedTracker();
       tracker.markPending(id);
       await tracker.poll(id, makeProvider({ receipt: null, throwTx: true }));
-      expect(tracker.get(id).state).to.equal("UNKNOWN");
+      expect(tracker.get(id).state).to.equal("PENDING");
       expect(tracker.get(id).state).to.not.equal("DROPPED");
     });
   });
@@ -652,12 +674,12 @@ describe("read-only API (get/list) + determinism", () => {
     it("60 — tracker NEVER frees/rolls back the nonce it tracks (no NonceManager coupling)", async () => {
       const { tracker, id } = await makeSubmittedTracker();
       tracker.markPending(id);
-      await tracker.poll(id, makeProvider({ receipt: null, tx: null })); // → UNKNOWN
-      await tracker.poll(id, makeProvider({ receipt: null, tx: null })); // still UNKNOWN
+      await tracker.poll(id, makeProvider({ receipt: null, tx: null })); // → PENDING (TASK 4.7-R)
+      await tracker.poll(id, makeProvider({ receipt: null, tx: null })); // still PENDING
       // Record remains, nonce still reserved for that record — nothing freed.
-      expect(tracker.get(id).state).to.equal("UNKNOWN");
+      expect(tracker.get(id).state).to.equal("PENDING");
       expect(tracker.get(id).nonce).to.equal(7);
-      expect(tracker.list({ state: "UNKNOWN" }).length).to.equal(1);
+      expect(tracker.list({ state: "PENDING" }).length).to.equal(1);
     });
   });
 describe("hardening — validation & terminal-state poll safety", () => {
@@ -773,5 +795,176 @@ describe("hardening — validation & terminal-state poll safety", () => {
         expect.fail(`poll on DROPPED threw: ${e.message}`);
       }
       expect(s2.state).to.equal("DROPPED");
+    });
+  });
+
+describe("TASK 4.7 — receipt identity & chain integrity (INVARIANT 7/8)", () => {
+    const OTHER_HASH = "0x" + "ff".repeat(32);
+
+    it("4.7.1 — receipt with MATCHING transactionHash → CONFIRMED (identity-bound)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      const provider = makeProvider({ receipt: { ...validReceipt(1), transactionHash: TX_HASH } });
+      const snap = await tracker.poll(id, provider);
+      expect(snap.state).to.equal("CONFIRMED");
+      expect(tracker.get(id).receiptStatus).to.equal(1);
+    });
+
+    it("4.7.2 — receipt with MISMATCHED transactionHash → UNKNOWN (foreign receipt, fail-closed)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      const provider = makeProvider({ receipt: { ...validReceipt(1), transactionHash: OTHER_HASH } });
+      const snap = await tracker.poll(id, provider);
+      // INVARIANT 7: un receipt străin NU poate fi clasificat ca succes.
+      expect(snap.state).to.equal("UNKNOWN");
+      expect(snap.state).to.not.equal("CONFIRMED");
+      expect(tracker.get(id).lastError).to.include("receipt hash mismatch");
+    });
+
+    it("4.7.3 — matching transactionHash case-insensitive → CONFIRMED", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      const provider = makeProvider({ receipt: { ...validReceipt(1), transactionHash: TX_HASH.toUpperCase() } });
+      const snap = await tracker.poll(id, provider);
+      expect(snap.state).to.equal("CONFIRMED");
+    });
+
+    it("4.7.4 — provider chainId matches expectedChainId → CONFIRMED", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      const provider = makeProvider({ receipt: validReceipt(1), network: { chainId: 56n } });
+      const snap = await tracker.poll(id, provider, undefined, { expectedChainId: 56 });
+      expect(snap.state).to.equal("CONFIRMED");
+    });
+
+    it("4.7.5 — provider chainId mismatch → UNKNOWN (INVARIANT 8, fail-closed)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      const provider = makeProvider({ receipt: validReceipt(1), network: { chainId: 1n } });
+      const snap = await tracker.poll(id, provider, undefined, { expectedChainId: 56 });
+      expect(snap.state).to.equal("UNKNOWN");
+      expect(tracker.get(id).lastError).to.include("chain mismatch");
+    });
+
+    it("4.7.6 — provider network unavailable (getNetwork throws) → UNKNOWN", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      const provider = makeProvider({ receipt: validReceipt(1), throwNetwork: true });
+      const snap = await tracker.poll(id, provider, undefined, { expectedChainId: 56 });
+      expect(snap.state).to.equal("UNKNOWN");
+      expect(tracker.get(id).lastError).to.include("chain mismatch");
+    });
+
+    it("4.7.7 — WITHOUT expectedChainId the legacy 3-arg call still works (backwards compatible)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      tracker.markPending(id);
+      const provider = makeProvider({ receipt: validReceipt(1), network: { chainId: 1n } });
+      const snap = await tracker.poll(id, provider);
+      expect(snap.state).to.equal("CONFIRMED");
+    });
+  });
+
+describe("TASK 4.7-R — PENDING lifecycle semantics (NO RECEIPT = PENDING)", () => {
+    const OTHER_HASH = "0x" + "ff".repeat(32);
+
+    it("R.1 — SUBMITTED → PENDING on null receipt", async () => {
+      const { tracker, id } = await makeSubmittedTracker(); // state = SUBMITTED
+      const snap = await tracker.poll(id, makeProvider({ receipt: null }));
+      expect(snap.state).to.equal("PENDING");
+    });
+
+    it("R.2 — PENDING → PENDING → PENDING (idempotent, never upgraded by time)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      await tracker.poll(id, makeProvider({ receipt: null }));
+      await tracker.poll(id, makeProvider({ receipt: null }));
+      const snap = await tracker.poll(id, makeProvider({ receipt: null }));
+      expect(snap.state).to.equal("PENDING");
+      expect(tracker.get(id).state).to.equal("PENDING");
+    });
+
+    it("R.3 — SUBMITTED → PENDING → PENDING → PENDING → CONFIRMED (task lifecycle example)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      expect((await tracker.poll(id, makeProvider({ receipt: null }))).state).to.equal("PENDING");
+      expect((await tracker.poll(id, makeProvider({ receipt: null }))).state).to.equal("PENDING");
+      expect((await tracker.poll(id, makeProvider({ receipt: null }))).state).to.equal("PENDING");
+      const done = await tracker.poll(id, makeProvider({ receipt: validReceipt(1, 555) }));
+      // CONFIRMED ≡ CONFIRMED_SUCCESS (starea terminală existentă a proiectului)
+      expect(done.state).to.equal("CONFIRMED");
+      expect(done.receiptStatus).to.equal(1);
+    });
+
+    it("R.4 — PENDING → REVERTED on status-0 receipt (≡ CONFIRMED_REVERT)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      await tracker.poll(id, makeProvider({ receipt: null }));
+      const snap = await tracker.poll(id, makeProvider({ receipt: validReceipt(0, 600) }));
+      expect(snap.state).to.equal("REVERTED");
+      expect(snap.receiptStatus).to.equal(0);
+    });
+
+    it("R.5 — null receipt is NEVER DROPPED (poll has no drop heuristic)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      for (let i = 0; i < 10; i++) await tracker.poll(id, makeProvider({ receipt: null }));
+      expect(tracker.get(id).state).to.equal("PENDING");
+      expect(tracker.get(id).state).to.not.equal("DROPPED");
+    });
+
+    it("R.6 — null receipt alone is NEVER UNKNOWN (TASK 4.7-R core correction)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      for (let i = 0; i < 10; i++) await tracker.poll(id, makeProvider({ receipt: null }));
+      expect(tracker.get(id).state).to.not.equal("UNKNOWN");
+      expect(tracker.get(id).state).to.equal("PENDING");
+    });
+
+    it("R.7 — missing receipt status → UNKNOWN (never success)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      await tracker.poll(id, makeProvider({ receipt: null }));
+      await tracker.poll(id, makeProvider({ receipt: { blockNumber: 1, blockHash: BLOCK_HASH } }));
+      expect(tracker.get(id).state).to.equal("UNKNOWN");
+    });
+
+    it("R.8 — receipt RPC failure → UNKNOWN (genuine uncertainty)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      await tracker.poll(id, makeProvider({ receipt: null }));
+      const snap = await tracker.poll(id, makeProvider({ throwReceipt: true }));
+      expect(snap.state).to.equal("UNKNOWN");
+      expect(tracker.get(id).lastError).to.include("receipt RPC error");
+    });
+
+    it("R.9 — foreign receipt → UNKNOWN (identity binding preserved, TASK 4.7)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      await tracker.poll(id, makeProvider({ receipt: null }));
+      const snap = await tracker.poll(id, makeProvider({ receipt: { ...validReceipt(1), transactionHash: OTHER_HASH } }));
+      expect(snap.state).to.equal("UNKNOWN");
+      expect(tracker.get(id).lastError).to.include("receipt hash mismatch");
+    });
+
+    it("R.10 — chain mismatch → UNKNOWN (chain identity preserved, TASK 4.7)", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      await tracker.poll(id, makeProvider({ receipt: null }));
+      const snap = await tracker.poll(id, makeProvider({ receipt: validReceipt(1), network: { chainId: 1n } }), undefined, { expectedChainId: 56 });
+      expect(snap.state).to.equal("UNKNOWN");
+      expect(tracker.get(id).lastError).to.include("chain mismatch");
+    });
+
+    it("R.11 — REPLACED only via explicit replace() evidence — poll NEVER deduces it", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      for (let i = 0; i < 3; i++) await tracker.poll(id, makeProvider({ receipt: null }));
+      const rec = tracker.get(id);
+      expect(rec.state).to.equal("PENDING");
+      expect(rec.replacedBy).to.equal(null);
+      expect(rec.replaces).to.equal(null);
+      // The ONLY path to replacement semantics is the explicit 4.5-C API:
+      const rep = tracker.replace(id, { txHash: OTHER_HASH });
+      expect(tracker.get(id).replacedBy).to.equal(rep.id);
+      expect(tracker.get(rep.id).replaces).to.equal(id);
+    });
+
+    it("R.12 — DROPPED only via explicit transition with evidence — poll NEVER deduces it", async () => {
+      const { tracker, id } = await makeSubmittedTracker();
+      await tracker.poll(id, makeProvider({ receipt: null }));
+      expect(tracker.get(id).state).to.equal("PENDING");
+      // Explicit, defensible evidence (operator/external proof) → explicit drop:
+      tracker.transition(id, "DROPPED");
+      expect(tracker.get(id).state).to.equal("DROPPED");
     });
   });

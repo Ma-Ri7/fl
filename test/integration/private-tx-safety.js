@@ -425,12 +425,15 @@ describe("C — on-chain observation of a private tx (tracker level)", () => {
       expect(snap.state).to.equal("UNKNOWN");
     });
 
-    it("25 — null tx + null receipt remains UNKNOWN (never DROPPED)", async () => {
+    it("25 — null tx + null receipt → PENDING (never DROPPED) (TASK 4.7-R)", async () => {
       const { tracker, id } = await makeTracked();
       tracker.transition(id, "UNKNOWN");
       for (let i = 0; i < 3; i++) {
         const snap = await tracker.poll(id, makePollProvider({ receipt: null, tx: null }));
-        expect(snap.state).to.equal("UNKNOWN");
+        // TASK 4.7-R: un poll reușit care stabilește „nu a fost minată”
+        // recuperează recordul din UNKNOWN în PENDING (dovadă pozitivă),
+        // niciodată DROPPED.
+        expect(snap.state).to.equal("PENDING");
         expect(snap.state).to.not.equal("DROPPED");
       }
     });
@@ -470,9 +473,11 @@ describe("D — replacement safety (same nonce, different hash)", () => {
       const rep = tracker.replace(id, { txHash: H2, wallet: WALLET_A, mode: "private" });
       const a = await tracker.poll(id, makePollProvider({ receipt: null, tx: null }));
       const b = await tracker.poll(rep.id, makePollProvider({ receipt: validReceipt(1, 900) }));
-      expect(a.state).to.equal("UNKNOWN");
+      // TASK 4.7-R: originalul fără receipt rămâne PENDING (nu UNKNOWN);
+      // replacement-ul confirmat rămâne CONFIRMED — identități distincte.
+      expect(a.state).to.equal("PENDING");
       expect(b.state).to.equal("CONFIRMED");
-      expect(tracker.get(id).state).to.equal("UNKNOWN");
+      expect(tracker.get(id).state).to.equal("PENDING");
       expect(tracker.get(rep.id).state).to.equal("CONFIRMED");
     });
 
@@ -712,7 +717,8 @@ describe("G — identity", () => {
       await tracker.poll(a.id, makePollProvider({ receipt: validReceipt(1) }));
       await tracker.poll(b.id, makePollProvider({ receipt: null, tx: null }));
       expect(tracker.get(a.id).state).to.equal("CONFIRMED");
-      expect(tracker.get(b.id).state).to.equal("UNKNOWN");
+      // TASK 4.7-R: b fără receipt → PENDING (nu UNKNOWN), identitate distinctă.
+      expect(tracker.get(b.id).state).to.equal("PENDING");
       expect(tracker.get(a.id).txHash).to.equal(H1);
       expect(tracker.get(b.id).txHash).to.equal(H2);
     });

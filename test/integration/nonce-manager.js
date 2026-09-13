@@ -226,4 +226,55 @@ describe("TASK 4.5-A — NonceManager Lifecycle & Single-Owner Discipline", func
       expect(await mgr.init(true)).to.equal(99);
     });
   });
+
+  // TASK 4.7-R — nonce safety vs. post-broadcast outcome (section 10 / 18-19).
+  // Regula: un slot de nonce se eliberează EXCLUSIV pe baza dovezilor on-chain
+  // (receipt existent SAU tx dispărut din mempool), NICIODATĂ pe baza stării
+  // tracker-ului (PENDING / UNKNOWN). Starea PENDING nu eliberează nonce-ul.
+  describe("TASK 4.7-R — nonce safety vs. post-broadcast outcome (section 10/18-19)", function () {
+    function reapProvider(overrides = {}) {
+      return {
+        receipt: overrides.receipt !== undefined ? overrides.receipt : null,
+        tx: overrides.tx !== undefined ? overrides.tx : null,
+        throwReceipt: !!overrides.throwReceipt,
+        async getTransactionReceipt() {
+          if (overrides.throwReceipt) throw new Error("RPC failure: receipt");
+          return overrides.receipt !== undefined ? overrides.receipt : null;
+        },
+        async getTransaction() {
+          return overrides.tx !== undefined ? overrides.tx : null;
+        },
+      };
+    }
+
+    it("R.18 — tracker PENDING state does NOT release the nonce (tracker/nonce decoupling)", async function () {
+      // Secțiunea 10: PENDING nu trebuie să elibereze slotul de nonce.
+      // Tracker-ul și NonceManager sunt DECOUPLED (tracker-ul nu apelează
+      // niciodată NonceManager — vezi testul 60). Verificăm că clasificarea
+      // tracker-ului în PENDING nu are NICIUN efect lateral asupra nonce-ului.
+      const { mgr } = makeManager({ startNonce: 100 });
+      const n = await mgr.reserve();
+      mgr.commit(n, "0x" + "ab".repeat(32));
+      // Nonce-ul este deținut de NonceManager (pending), nu de tracker.
+      expect(mgr.pending.has(n)).to.equal(true);
+      // Un tracker extern ajunge în PENDING (receipt null) — dar nu atinge nonce-ul.
+      // (reap cu tx:null ar elibera prin logica 4.5-A de mempool-absence, care
+      //  este un mecanism SEPARAT și corect; aici testăm doar decuplarea.)
+      const next = await mgr.reserve();
+      expect(next).to.not.equal(n);
+      expect(mgr.pending.has(n)).to.equal(true); // încă deținut
+    });
+
+    it("R.19 — CONFIRMED_REVERT (status 0) burns/releases the nonce per 4.5-A", async function () {
+      const { mgr } = makeManager({ startNonce: 200 });
+      const n = await mgr.reserve();
+      mgr.commit(n, "0x" + "cd".repeat(32));
+      // Receipt cu status 0 = tranzacție inclusă dar retrasă → nonce consumat.
+      await mgr.reap(reapProvider({
+        receipt: { status: 0, blockNumber: 500, blockHash: "0x" + "be".repeat(32) },
+      }));
+      // Nonce-ul a fost inclus (chiar și ca revert) → slot eliberat.
+      expect(mgr.pending.has(n)).to.equal(false);
+    });
+  });
 });

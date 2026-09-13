@@ -101,7 +101,7 @@ function validateBlockHash(hash) {
   return hash.toLowerCase();
 }
 
-function validateReceipt(receipt) {
+function validateReceipt(receipt, expectedTxHash) {
   if (receipt === null || receipt === undefined) return null;
   if (typeof receipt !== "object") {
     throw new Error("pnl: invalid receipt (not an object)");
@@ -109,11 +109,25 @@ function validateReceipt(receipt) {
   if (receipt.status !== 0 && receipt.status !== 1) {
     throw new Error(`pnl: invalid receipt status (${String(receipt.status)})`);
   }
+  // TASK 4.7 (INVARIANT 7): receipt-ul trebuie să aparțină tranzacției
+  // înregistrate. Dacă provider-ul include transactionHash și acesta NU
+  // corespunde txHash-ului înregistrat => receipt străin => FAIL CLOSED.
+  if (receipt.transactionHash != null) {
+    if (typeof receipt.transactionHash !== "string" || !HEX_HASH_RE.test(receipt.transactionHash)) {
+      throw new Error(`pnl: invalid receipt.transactionHash (${String(receipt.transactionHash)})`);
+    }
+  }
   if (typeof receipt.gasUsed !== "bigint") {
     throw new Error(`pnl: invalid receipt.gasUsed (${typeof receipt.gasUsed})`);
   }
   if (typeof receipt.effectiveGasPrice !== "bigint") {
     throw new Error(`pnl: invalid receipt.effectiveGasPrice (${typeof receipt.effectiveGasPrice})`);
+  }
+  if (
+    receipt.transactionHash != null &&
+    receipt.transactionHash.toLowerCase() !== String(expectedTxHash).toLowerCase()
+  ) {
+    throw new Error("pnl: receipt hash mismatch (foreign receipt)");
   }
   return {
     status: receipt.status,
@@ -167,7 +181,7 @@ class PnLTracker {
     const flashloanFeeRaw = validateBigIntOrNull(data.flashloanFeeRaw, "flashloanFeeRaw", { allowNegative: false }) || 0n;
     const externalInflowRaw = validateBigIntOrNull(data.externalInflowRaw, "externalInflowRaw", { allowNegative: false }) || 0n;
     const externalOutflowRaw = validateBigIntOrNull(data.externalOutflowRaw, "externalOutflowRaw", { allowNegative: false }) || 0n;
-    const receipt = validateReceipt(data.receipt);
+    const receipt = validateReceipt(data.receipt, txHash);
     const blockNumber = validateNonNegativeIntOrNull(
       data.blockNumber !== undefined ? data.blockNumber : (receipt ? receipt.blockNumber : null), "blockNumber");
     const blockHash = validateBlockHash(

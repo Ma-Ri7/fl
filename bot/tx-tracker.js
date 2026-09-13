@@ -282,16 +282,29 @@ class TransactionTracker {
    * record accordingly (fail-closed).
    *
    * Order:
-   *   1. receipt (status 1 -> CONFIRMED, status 0 -> REVERTED if valid);
-   *   2. transaction visible -> PENDING;
-   *   3. neither -> UNKNOWN (NEVER DROPPED);
-   *   4. any RPC error -> UNKNOWN with lastError.
+   *   0. OPTIONAL chain identity check (TASK 4.7, INVARIANT 8): when
+   *      opts.expectedChainId is provided, the observation provider MUST prove
+   *      chainId === expectedChainId; missing/erroneous network => UNKNOWN.
+   *   1. receipt (source of truth for finalization):
+   *        - receipt RPC error            => UNKNOWN (cannot establish state);
+   *        - malformed/foreign receipt    => UNKNOWN (TASK 4.7, INVARIANT 7);
+   *        - status === 1                 => CONFIRMED (= CONFIRMED_SUCCESS);
+   *        - status === 0                 => REVERTED  (= CONFIRMED_REVERT).
+   *   2. TASK 4.7-R — receipt === null   => PENDING (definitively NOT mined
+   *      yet). PENDING is kept on repeated null polls; it is NEVER upgraded to
+   *      UNKNOWN/DROPPED/REPLACED by the passage of time or by mempool
+   *      invisibility (private submissions are expected to be invisible —
+   *      4.5-D tombstone semantics). DROPPED/REPLACED require explicit
+   *      defensible evidence (explicit transition / replace() API), never a
+   *      poll heuristic.
    *
    * @param {string} id
-   * @param {object} provider { getTransactionReceipt, getTransaction }
+   * @param {object} provider { getTransactionReceipt [, getNetwork] }
+   * @param {string} [wallet]
+   * @param {object} [opts] { expectedChainId? } — mandatory observation chain
    * @returns {object} read-only snapshot AFTER the poll
    */
-  async poll(id, provider, wallet) {
+  async poll(id, provider, wallet, opts = {}) {
     const rec = this._getRecord(id);
     // Wallet identity (TASK 4.5-D §27) — enforced BEFORE any provider call.
     this._checkWallet(rec, wallet);
@@ -305,6 +318,23 @@ class TransactionTracker {
     }
     const hash = rec.txHash;
 
+    // PAS 0 — chain identity (TASK 4.7 INVARIANT 8). Fail-closed ÎNAINTE de a
+    // accepta ORICE observare: lipsă/malformat/mismatch => UNKNOWN.
+    if (opts.expectedChainId !== undefined && opts.expectedChainId !== null) {
+      let cid = null;
+      try {
+        const net = await provider.getNetwork();
+        cid = net && typeof net.chainId !== "undefined" ? BigInt(net.chainId) : null;
+      } catch (_) {
+        cid = null;
+      }
+      if (cid === null || cid !== BigInt(opts.expectedChainId)) {
+        return this.transition(id, "UNKNOWN", {
+          lastError: `chain mismatch (expected ${opts.expectedChainId}, got ${cid === null ? "n/a" : cid})`,
+        });
+      }
+    }
+
     // PAS 1 — receipt (source of truth for finalization).
     let receipt = null;
     try {
@@ -317,6 +347,15 @@ class TransactionTracker {
         // Ambiguous receipt shape — fail-closed, never fabricate finality.
         return this.transition(id, "UNKNOWN", { lastError: "invalid receipt" });
       }
+      // TASK 4.7 (INVARIANT 7): receipt-ul trebuie să aparțină tranzacției
+      // track-uite. Dacă provider-ul include transactionHash și acesta NU
+      // corespunde hash-ului track-uit => receipt străin => UNKNOWN.
+      if (receipt.transactionHash != null) {
+        const rh = typeof receipt.transactionHash === "string" ? receipt.transactionHash.toLowerCase() : null;
+        if (rh !== hash.toLowerCase()) {
+          return this.transition(id, "UNKNOWN", { lastError: "receipt hash mismatch" });
+        }
+      }
       const target = receipt.status === 1 ? "CONFIRMED" : "REVERTED";
       return this.transition(id, target, {
         receiptStatus: receipt.status,
@@ -326,18 +365,16 @@ class TransactionTracker {
       });
     }
 
-    // PAS 2 — transaction visible in mempool.
-    try {
-      const tx = await provider.getTransaction(hash);
-      if (tx != null) {
-        return this.transition(id, "PENDING");
-      }
-    } catch (e) {
-      return this.transition(id, "UNKNOWN", { lastError: `tx RPC error: ${e.message}` });
-    }
-
-    // PAS 3 — neither receipt nor transaction available: UNKNOWN, never DROPPED.
-    return this.transition(id, "UNKNOWN", { lastError: "no receipt and no transaction visible" });
+    // TASK 4.7-R — PENDING SEMANTICS (INVARIANT: NO RECEIPT = PENDING).
+    // receipt === null este cunoaștere POZITIVĂ: tranzacția NU a fost minată
+    // încă (receipt-urile sunt permanente odată produse). Atâta timp cât nu
+    // există dovezi suficiente pentru altă stare (replacement/drop), starea
+    // corectă este PENDING — inclusiv pentru submissions private, care pot fi
+    // invizibile în mempool-ul public în timp ce așteaptă includerea
+    // (semantica tombstone 4.5-D). Niciodată UNKNOWN, niciodată DROPPED,
+    // niciodată REPLACED doar pentru că receipt-ul lipsește.
+    // lastError se curăță: starea PENDING nu are o eroare curentă.
+    return this.transition(id, "PENDING", { lastError: null });
   }
 
   // -- read-only API ---------------------------------------------------------

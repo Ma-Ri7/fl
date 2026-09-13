@@ -31,20 +31,69 @@ function parseArbitrageExecuted(receipt) {
 }
 
 /**
- * Așteaptă confirmarea unei tranzacții și calculează P&L-ul realizat.
+ * Așteaptă confirmarea unei tranzacții și clasifică rezultatul on-chain.
+ *
+ * TASK 4.7 — POST-BROADCAST OUTCOME & RECEIPT INTEGRITY:
+ *   - "mined" înseamnă DOAR receipt cu status 1 (execuție reușită);
+ *   - receipt cu status 0 => "reverted" (INVARIANT 2/3 — niciodată "mined");
+ *   - receipt-ul trebuie să aparțină txHash-ului cerut (INVARIANT 7) —
+ *     transactionHash lipsă/diferit => "unknown";
+ *   - provider-ul trebuie să dovedească chainId 56 (INVARIANT 8) —
+ *     rețea lipsă/erone/diferită => "unknown";
+ *   - lipsă receipt / eroare RPC => "timeout"/"unknown" — niciodată succes
+ *     (INVARIANT 4/6: broadcast acknowledgement ≠ confirmation).
  * @param {ethers.Provider} provider
- * @param {object} opts { txHash, expectedProfit, tokenDecimals=18, timeoutMs=120000 }
- * @returns {Promise<{status:'mined'|'timeout'|'error', blockNumber?, realizedProfit?, gasCostBnb?, gasUsed?, txHash, event?}>}
+ * @param {object} opts { txHash, expectedChainId=56, timeoutMs=120000 }
+ * @returns {Promise<{status:'mined'|'reverted'|'timeout'|'unknown', txHash,
+ *   blockNumber?, gasUsed?, effectiveGasPrice?, gasCostBnb?, realizedProfit?,
+ *   event?, lastError?}>}
  */
 async function trackTransaction(provider, opts = {}) {
-  const { txHash, timeoutMs = 120000 } = opts;
+  const { txHash, timeoutMs = 120000, expectedChainId = 56 } = opts;
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
+    // INVARIANT 8 — chain identity la momentul observării.
+    try {
+      const net = await provider.getNetwork();
+      if (!net || BigInt(net.chainId) !== BigInt(expectedChainId)) {
+        return { status: "unknown", txHash, lastError: `chain mismatch (expected ${expectedChainId}, got ${net ? net.chainId : "n/a"})` };
+      }
+    } catch (e) {
+      return { status: "unknown", txHash, lastError: `network unavailable: ${e.message.slice(0, 80)}` };
+    }
     try {
       const receipt = await provider.getTransactionReceipt(txHash);
       if (receipt && receipt.blockNumber) {
+        // INVARIANT 7 — receipt identity binding: transactionHash lipsă sau
+        // diferit de hash-ul cerut => observare străină => "unknown".
+        if (receipt.transactionHash != null) {
+          const rh = typeof receipt.transactionHash === "string" ? receipt.transactionHash.toLowerCase() : null;
+          if (rh === null || rh !== txHash.toLowerCase()) {
+            return { status: "unknown", txHash, lastError: "receipt hash mismatch (foreign receipt)" };
+          }
+        }
         const ev = parseArbitrageExecuted(receipt);
-        const gasCostBnb = receipt.gasUsed * (receipt.gasPrice || 0n);
+        // Gas-ul real provine din receipt: gasUsed × effectiveGasPrice.
+        // (vârful vechi gasPrice || 0n produccea cost=0 pentru tx-uri 1559.)
+        const gasCostBnb = receipt.gasUsed * (receipt.effectiveGasPrice || receipt.gasPrice || 0n);
+        // INVARIANT 2 — succes DOAR cu status === 1 (explicit). Orice altă
+        // valoare (0, undefined, string, null) NU este succes.
+        if (receipt.status === 0) {
+          // INVARIANT 3 — revert DEFINITIV, niciodată "mined" și niciodată UNKNOWN.
+          logger.warn(`[tracker] tx=${txHash.slice(0, 14)}… status=reverted block=${receipt.blockNumber} gasUsed=${receipt.gasUsed}`);
+          return {
+            status: "reverted",
+            txHash,
+            blockNumber: receipt.blockNumber,
+            gasUsed: receipt.gasUsed,
+            effectiveGasPrice: receipt.effectiveGasPrice,
+            gasCostBnb,
+          };
+        }
+        if (receipt.status !== 1) {
+          // Receipt malformat (status lipsă/erat) — fail-closed, niciodată succes.
+          return { status: "unknown", txHash, lastError: `invalid receipt status (${String(receipt.status)})` };
+        }
         const realizedProfit = ev ? ev.profit : null;
         logger.info(
           `[tracker] tx=${txHash.slice(0, 14)}… status=mined block=${receipt.blockNumber} ` +
@@ -56,12 +105,14 @@ async function trackTransaction(provider, opts = {}) {
           txHash,
           blockNumber: receipt.blockNumber,
           gasUsed: receipt.gasUsed,
+          effectiveGasPrice: receipt.effectiveGasPrice,
           gasCostBnb,
           realizedProfit,
           event: ev,
         };
       }
     } catch (e) {
+      // eroare RPC — transientă: rămânem în buclă până la timeout (INVARIANT 4).
       logger.warn(`[tracker] receipt error ${e.message.slice(0, 80)}`);
     }
     await new Promise((r) => setTimeout(r, 1500));
