@@ -270,6 +270,7 @@ function makeProvider(feeData) {
   return {
     getBlockNumber: async () => 100,
     getFeeData: async () => feeData,
+    getNetwork: async () => ({ chainId: 56n }),
   };
 }
 
@@ -367,7 +368,7 @@ describe("TASK 4.6-C — Executor integration (ordering & binding)", () => {
   const ACCEPT_FEE = DI_NET / 700000n;             // floor(net/700000)
 
   it("C6: mutația estimate-ului schimbă verdictul (fresh estimate, nu cached)", async () => {
-    await withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: "0x" + "ab".repeat(16), block: 1 }), async (executor) => {
+    await withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: "0x" + "ab".repeat(32), signedHash: "0x" + "ab".repeat(32), block: 1 }), async (executor) => {
       // A: estimate 100000n (buffered 120000n) la ACELAȘI fee => ACCEPT
       const okA = await executor.executeOpp(makeDiOpp(), CONTRACT, makeWallet(100000n), makeProvider({ gasPrice: REJECT_FEE }), { nonceManager: spyManager() });
       expect(okA.ok).to.equal(true);
@@ -381,7 +382,7 @@ describe("TASK 4.6-C — Executor integration (ordering & binding)", () => {
   });
 
   it("C7: mutația gas price-ului închide fereastra (fee mare => REJECT înainte de nonce)", async () => {
-    await withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: "0x" + "ab".repeat(16), block: 1 }), async (executor) => {
+    await withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: "0x" + "ab".repeat(32), signedHash: "0x" + "ab".repeat(32), block: 1 }), async (executor) => {
       const okLow = await executor.executeOpp(makeDiOpp(), CONTRACT, makeWallet(100000n), makeProvider({ gasPrice: ACCEPT_FEE }), { nonceManager: spyManager() });
       expect(okLow.ok).to.equal(true);
       const mgrHigh = spyManager();
@@ -397,7 +398,7 @@ describe("TASK 4.6-C — Executor integration (ordering & binding)", () => {
 
   it("C8: private relay primește bound-ul VALIDAT (gasLimit buffered + maxFeePerGas validated)", async () => {
     const seen = [];
-    await withIsolatedExecutor(async (args) => { seen.push(args); return { ok: true, status: "accepted", txHash: "0x" + "cd".repeat(16), block: 1 }; }, async (executor) => {
+    await withIsolatedExecutor(async (args) => { seen.push(args); return { ok: true, status: "accepted", txHash: "0x" + "cd".repeat(32), signedHash: "0x" + "cd".repeat(32), block: 1 }; }, async (executor) => {
       const res = await executor.executeOpp(makeDiOpp(), CONTRACT, makeWallet(100000n), makeProvider({ gasPrice: ACCEPT_FEE }), { nonceManager: spyManager() });
       expect(res.ok).to.equal(true);
       expect(seen.length).to.equal(1);
@@ -420,7 +421,7 @@ describe("TASK 4.6-C — Executor integration (ordering & binding)", () => {
   });
 
   it("C10: executeOpp nu mută oportunitatea (deep compare pe accept ȘI reject)", async () => {
-    await withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: "0x" + "ef".repeat(16), block: 1 }), async (executor) => {
+    await withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: "0x" + "ef".repeat(32), signedHash: "0x" + "ef".repeat(32), block: 1 }), async (executor) => {
       const opp = makeDiOpp();
       const before = snap(opp);
       await executor.executeOpp(opp, CONTRACT, makeWallet(100000n), makeProvider({ gasPrice: ACCEPT_FEE }), { nonceManager: spyManager() });
@@ -434,7 +435,7 @@ describe("TASK 4.6-C — Executor integration (ordering & binding)", () => {
 
   it("A1 (audit F1): maxFeePerGas malformed în feeData → relay primește BOUND-UL validat, nu valoarea raw", async () => {
     const seen = [];
-    await withIsolatedExecutor(async (args) => { seen.push(args); return { ok: true, status: "accepted", txHash: "0x" + "11".repeat(16), block: 1 }; }, async (executor) => {
+    await withIsolatedExecutor(async (args) => { seen.push(args); return { ok: true, status: "accepted", txHash: "0x" + "11".repeat(32), signedHash: "0x" + "11".repeat(32), block: 1 }; }, async (executor) => {
       const malformed = "9".repeat(10); // truthy dar invalid
       const res = await executor.executeOpp(makeDiOpp(), CONTRACT, makeWallet(100000n), makeProvider({ gasPrice: ACCEPT_FEE, maxFeePerGas: malformed }), { nonceManager: spyManager() });
       expect(res.ok).to.equal(true);
@@ -449,7 +450,7 @@ describe("TASK 4.6-C — Executor integration (ordering & binding)", () => {
 
   it("A2 (audit F2): priority tip malformed sau > bound → relay primește un tip sanitizat ≤ bound", async () => {
     const seen = [];
-    await withIsolatedExecutor(async (args) => { seen.push(args); return { ok: true, status: "accepted", txHash: "0x" + "22".repeat(16), block: 1 }; }, async (executor) => {
+    await withIsolatedExecutor(async (args) => { seen.push(args); return { ok: true, status: "accepted", txHash: "0x" + "22".repeat(32), signedHash: "0x" + "22".repeat(32), block: 1 }; }, async (executor) => {
       // caz 1: priority malformed (string truthy)
       await executor.executeOpp(makeDiOpp(), CONTRACT, makeWallet(100000n), makeProvider({ gasPrice: ACCEPT_FEE, maxPriorityFeePerGas: "tip" }), { nonceManager: spyManager() });
       expect(seen[0].maxPriorityFeePerGas).to.equal(0n);
@@ -468,7 +469,7 @@ describe("TASK 4.6-C — Executor integration (ordering & binding)", () => {
 
   it("A3 (audit F1/F2): feeData 1559 complet valid → relay primește exact bound-ul worst-case", async () => {
     const seen = [];
-    await withIsolatedExecutor(async (args) => { seen.push(args); return { ok: true, status: "accepted", txHash: "0x" + "33".repeat(16), block: 1 }; }, async (executor) => {
+    await withIsolatedExecutor(async (args) => { seen.push(args); return { ok: true, status: "accepted", txHash: "0x" + "33".repeat(32), signedHash: "0x" + "33".repeat(32), block: 1 }; }, async (executor) => {
       // gasPrice > maxFeePerGas → bound = max = gasPrice
       const res = await executor.executeOpp(makeDiOpp(), CONTRACT, makeWallet(100000n), makeProvider({ gasPrice: 9n, maxFeePerGas: 3n, maxPriorityFeePerGas: 2n }), { nonceManager: spyManager() });
       expect(res.ok).to.equal(true);

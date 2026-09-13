@@ -59,6 +59,7 @@ function makeProvider() {
   return {
     getBlockNumber: async () => 100,
     getFeeData: async () => ({ gasPrice: 1n }),
+    getNetwork: async () => ({ chainId: 56n }),
   };
 }
 
@@ -112,7 +113,7 @@ function withIsolatedExecutor(bloxrouteHandler, fn) {
 describe("TASK 4.5-D — Private TX / UNKNOWN / Replacement Safety", () => {
 describe("A — private submission lifecycle (executor + real tracker + real NonceManager)", () => {
     it("1 — private accepted → tracker record SUBMITTED (mode private, txHash set)", async () => {
-      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, block: 123 }), async (executor) => {
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H1, block: 123 }), async (executor) => {
         const tracker = new TransactionTracker();
         const mgr = new RealNonceManager(makeWallet(), 10);
         const res = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), makeWallet(), makeProvider(), { nonceManager: mgr, txTracker: tracker });
@@ -128,7 +129,7 @@ describe("A — private submission lifecycle (executor + real tracker + real Non
     });
 
     it("2 — accepted tx keeps nonce owned (pending, not reusable)", async () => {
-      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, block: 123 }), async (executor) => {
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H1, block: 123 }), async (executor) => {
         const tracker = new TransactionTracker();
         const mgr = new RealNonceManager(makeWallet(), 10);
         const res = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), makeWallet(), makeProvider(), { nonceManager: mgr, txTracker: tracker });
@@ -142,7 +143,7 @@ describe("A — private submission lifecycle (executor + real tracker + real Non
 
     it("3 — accepted + commit failure → nonce-commit-failed, rollback NEVER called", async () => {
       const rollbackSpy = [];
-      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, block: 123 }), async (executor) => {
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H1, block: 123 }), async (executor) => {
         const tracker = new TransactionTracker();
         const mgr = {
           async reserve() { return 7; },
@@ -159,7 +160,7 @@ describe("A — private submission lifecycle (executor + real tracker + real Non
     });
 
     it("4 — accepted relay without on-chain visibility → poll → UNKNOWN, NOT DROPPED, nonce owned", async () => {
-      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, block: 123 }), async (executor) => {
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H1, block: 123 }), async (executor) => {
         const tracker = new TransactionTracker();
         const mgr = new RealNonceManager(makeWallet(), 10);
         const res = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), makeWallet(), makeProvider(), { nonceManager: mgr, txTracker: tracker });
@@ -292,7 +293,7 @@ describe("B — nonce safety (real NonceManager + real tracker)", () => {
     });
 
     it("15 — tracker error AFTER accepted submission → nonce stays committed, rollback 0", async () => {
-      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, block: 1 }), async (executor) => {
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H1, block: 1 }), async (executor) => {
         const tracker = new TransactionTracker();
         // Injected failure point AFTER relay acceptance: markSubmitted throws.
         tracker.markSubmitted = () => { throw new Error("injected tracker failure"); };
@@ -311,7 +312,7 @@ describe("B — nonce safety (real NonceManager + real tracker)", () => {
     });
 
     it("16 — rollback ONLY before submission: tracker-create failure → rollback allowed", async () => {
-      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1 }), async (executor) => {
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H1 }), async (executor) => {
         const tracker = new TransactionTracker();
         // Injected failure point BEFORE any submission: create throws.
         tracker.create = () => { throw new Error("injected create failure"); };
@@ -646,7 +647,7 @@ describe("E — terminal safety (private tx context)", () => {
   });
 describe("F — concurrency / atomicity", () => {
     it("43 — concurrent private submissions do not reuse nonce (real manager)", async () => {
-      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, block: 1 }), async (executor) => {
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H1, block: 1 }), async (executor) => {
         const tracker = new TransactionTracker();
         const mgr = new RealNonceManager(makeWallet(), 10);
         const [r1, r2, r3] = await Promise.all([
@@ -764,7 +765,7 @@ describe("G — identity", () => {
   });
 describe("H — executor tracker integration & DI safety", () => {
     it("52 — executor uses injected tracker for the full lifecycle (private accepted)", async () => {
-      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, block: 5 }), async (executor) => {
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H1, block: 5 }), async (executor) => {
         const tracker = new TransactionTracker();
         const mgr = new RealNonceManager(makeWallet(), 10);
         const res = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), makeWallet(), makeProvider(), { nonceManager: mgr, txTracker: tracker });
@@ -779,7 +780,7 @@ describe("H — executor tracker integration & DI safety", () => {
     });
 
     it("53 — invalid injected tx-tracker is rejected explicitly (no silent fallback)", async () => {
-      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1 }), async (executor) => {
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H1 }), async (executor) => {
         const bad = { create: async () => ({ id: "x" }) }; // missing markSubmitted/poll
         let err;
         try {
@@ -799,6 +800,53 @@ describe("H — executor tracker integration & DI safety", () => {
         expect(rec.state).to.equal("UNKNOWN");
         expect(rec.txHash).to.equal(null);
         expect(mgr.pending.get(res.nonce).hash).to.equal(null);
+      });
+    });
+  });
+  describe("4.6-D-R — signedHash obligatoriu: fără fallback public automat (LOW-2)", () => {
+    it("R1 — relay accepted fără signedHash → relay-identity-unknown, NO public fallback, tombstone", async () => {
+      const sent = [];
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, block: 1 }), async (executor) => {
+        const tracker = new TransactionTracker();
+        const mgr = new RealNonceManager(makeWallet(sent), 10);
+        const res = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), makeWallet(sent), makeProvider(), { nonceManager: mgr, txTracker: tracker });
+        expect(res.ok).to.equal(false);
+        expect(res.reason).to.equal("relay-identity-unknown");
+        expect(sent.length).to.equal(0); // NICIODATĂ broadcast public
+        const rec = tracker.get(res.trackerId);
+        expect(rec.state).to.equal("UNKNOWN");
+        expect(mgr.pending.has(res.nonce)).to.equal(true); // tombstone
+        expect(mgr.pending.get(res.nonce).hash).to.equal(null);
+      });
+    });
+    it("R2 — relay accepted cu signedHash neegal cu txHash → relay-identity-unknown, NO public fallback", async () => {
+      const sent = [];
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H2, block: 1 }), async (executor) => {
+        const tracker = new TransactionTracker();
+        const mgr = new RealNonceManager(makeWallet(sent), 10);
+        const res = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), makeWallet(sent), makeProvider(), { nonceManager: mgr, txTracker: tracker });
+        expect(res.ok).to.equal(false);
+        expect(res.reason).to.equal("relay-identity-unknown");
+        expect(sent.length).to.equal(0); // NICIODATĂ broadcast public
+        const rec = tracker.get(res.trackerId);
+        expect(rec.state).to.equal("UNKNOWN");
+        expect(mgr.pending.has(res.nonce)).to.equal(true); // tombstone
+        expect(mgr.pending.get(res.nonce).hash).to.equal(null);
+      });
+    });
+    it("R3 — relay accepted cu signedHash MATCHING → flow privat normal (SUBMITTED, fără public)", async () => {
+      const sent = [];
+      withIsolatedExecutor(async () => ({ ok: true, status: "accepted", txHash: H1, signedHash: H1, block: 1 }), async (executor) => {
+        const tracker = new TransactionTracker();
+        const mgr = new RealNonceManager(makeWallet(sent), 10);
+        const res = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), makeWallet(sent), makeProvider(), { nonceManager: mgr, txTracker: tracker });
+        expect(res.ok).to.equal(true);
+        expect(res.private).to.equal(true);
+        expect(sent.length).to.equal(0); // acceptare privată — niciodată un al doilea broadcast
+        const rec = tracker.get(res.trackerId);
+        expect(rec.state).to.equal("SUBMITTED");
+        expect(rec.txHash).to.equal(H1);
+        expect(mgr.pending.get(res.nonce).hash).to.equal(H1);
       });
     });
   });

@@ -7,8 +7,8 @@
 //
 // Usage:
 //   const bloxroute = require('./bloxroute');
-//   const result = await bloxroute.sendBundle({ wallet, to, data, gasLimit, gasPrice, targetBlock });
-const { ethers } = require("ethers");
+//   const result = await bloxroute.sendPrivateTx({ wallet, to, data, gasLimit, maxFeePerGas, maxPriorityFeePerGas, nonce });
+const { ethers, keccak256 } = require("ethers");
 
 const BLOXROUTE_API = "https://mev.api.blxrbdn.com";
 const BUNDLE_API = "https://api.blxrbdn.com" + "/bundle"; // legacy fallback
@@ -42,24 +42,57 @@ async function sendPrivateTx(opts) {
   if (!token) return { ok: false, status: "failed", error: "no-token" };
 
   const wallet = opts.wallet;
-  const feeData = await wallet.provider.getFeeData();
-  const maxFeePerGas = opts.maxFeePerGas || feeData.maxFeePerGas || 5000000000n;
-  const maxPriorityFeePerGas = opts.maxPriorityFeePerGas || feeData.maxPriorityFeePerGas || 1000000000n;
+  // TASK 4.6-D (PHASE 11/14): bound-ul de fee și nonce-ul sunt CÂMPURI DE
+  // IDENTITATE validate de 4.6-C + executorul (approveTx). Ele sunt OBLIGATORII
+  // și se folosesc EXACT cum au fost aprobate — NICIODATĂ re-citite din
+  // feeData sau substituite cu fallback-uri arbitrare (vârful vechi
+  // "|| 5 gwei / || 1 gwei" ocolea economic guard-ul și muta identitatea).
+  if (
+    typeof opts.maxFeePerGas !== "bigint" ||
+    opts.maxFeePerGas <= 0n
+  ) {
+    return { ok: false, status: "failed", error: "missing-fee-bound" };
+  }
+  if (
+    typeof opts.maxPriorityFeePerGas !== "bigint" ||
+    opts.maxPriorityFeePerGas < 0n ||
+    opts.maxPriorityFeePerGas > opts.maxFeePerGas
+  ) {
+    return { ok: false, status: "failed", error: "invalid-priority-tip" };
+  }
+  if (opts.nonce === undefined || opts.nonce === null) {
+    // Reconstrucția nonce-ului din wallet este interzisă (PHASE 9): nonce-ul
+    // face parte din identitatea aprobată și rezervată de NonceManager.
+    return { ok: false, status: "failed", error: "missing-nonce" };
+  }
+  // RPC CONSISTENCY (PHASE 6/13): rețeaua provider-ului wallet-ului trebuie să
+  // fie BSC (chainId 56). Eșec definitiv ÎNAINTE de acceptare => "failed".
+  try {
+    const net = await wallet.provider.getNetwork();
+    if (BigInt(net.chainId) !== 56n) {
+      return { ok: false, status: "failed", error: `chainid-mismatch:${net.chainId}` };
+    }
+  } catch (e) {
+    return { ok: false, status: "failed", error: "network-unavailable" };
+  }
 
-  // Build the EIP-1559 transaction
+  // Build the EIP-1559 transaction — exact câmpurile aprobate, fără completări.
   const tx = {
     type: 2,
     to: opts.to,
     data: opts.data,
     gasLimit: opts.gasLimit,
-    maxFeePerGas,
-    maxPriorityFeePerGas,
-    nonce: opts.nonce !== undefined ? opts.nonce : await wallet.getNonce("pending"),
+    maxFeePerGas: opts.maxFeePerGas,
+    maxPriorityFeePerGas: opts.maxPriorityFeePerGas,
+    nonce: opts.nonce,
     chainId: 56,
   };
 
   // Sign locally (private key never leaves this machine)
   const signedTx = await wallet.signTransaction(tx);
+  // TASK 4.6-D (PHASE 18): hash-ul tranzacției SEMNATE local — executorul îl
+  // folosește pentru a lega răspunsul relay-ului de identitatea aprobată.
+  const signedHash = keccak256(signedTx);
 
   // Submit to BloXroute
   const body = {
@@ -84,51 +117,10 @@ async function sendPrivateTx(opts) {
     });
     const json = await res.json();
     if (json.error) return { ok: false, status: "failed", error: json.error.message };
-    return { ok: true, status: "accepted", txHash: json.result?.tx_hash, block: json.result?.block_number };
+    return { ok: true, status: "accepted", txHash: json.result?.tx_hash, signedHash, block: json.result?.block_number };
   } catch (e) {
     // rețea/timpout → stare NECUNOSCUTĂ: nu se fac alte submit-uri cu acest nonce
     return { ok: false, status: "unknown", error: e.message };
-  }
-}
-
-/**
- * Send a bundle of transactions atomically (all-or-nothing).
- * Useful for multi-leg arbitrage or when you want to combine multiple ops.
- *
- * @param {object} opts
- * @param {string[]} opts.signedTxs        - array of signed raw transactions
- * @param {number} [opts.targetBlock]      - target block number
- * @param {string} [opts.bloxrouteToken]   - auth token
- * @returns {Promise<{ok: boolean, bundleId?: string, error?: string}>}
- */
-async function sendBundle(opts) {
-  const token = opts.bloxrouteToken || process.env.BLOXROUTE_API_TOKEN;
-  if (!token) return { ok: false, error: "no-token" };
-
-  const body = {
-    id: "1",
-    jsonrpc: "2.0",
-    method: "blxr_submit_bundle",
-    params: {
-      transactions: opts.signedTxs,
-      block_number: opts.targetBlock ? "0x" + opts.targetBlock.toString(16) : "latest",
-    },
-  };
-
-  try {
-    const res = await fetch(BLOXROUTE_API, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": token,
-      },
-      body: JSON.stringify(body),
-    });
-    const json = await res.json();
-    if (json.error) return { ok: false, error: json.error.message };
-    return { ok: true, bundleId: json.result?.bundle_id };
-  } catch (e) {
-    return { ok: false, error: e.message };
   }
 }
 
@@ -151,4 +143,4 @@ async function isAvailable() {
   }
 }
 
-module.exports = { sendPrivateTx, sendBundle, isAvailable, BLOXROUTE_API };
+module.exports = { sendPrivateTx, isAvailable, BLOXROUTE_API };

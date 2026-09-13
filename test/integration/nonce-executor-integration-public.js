@@ -30,7 +30,7 @@ function makeWallet(sent = [], address = "0x" + "e1".repeat(20), startNonce = 0)
     call: async () => "0x" + "00".repeat(31) + "7b",
     estimateGas: async () => 100000n,
     async getNonce() { return nonce; },
-    sendTransaction(tx) { sent.push(tx); return { hash: "0x" + "tx".repeat(10) }; },
+    sendTransaction(tx) { sent.push(tx); return { hash: "0x" + "ab".repeat(32) }; },
   };
 }
 
@@ -38,6 +38,7 @@ function makeProvider() {
   return {
     getBlockNumber: async () => 100,
     getFeeData: async () => ({ gasPrice: 1n }),
+    getNetwork: async () => ({ chainId: 56n }),
   };
 }
 
@@ -69,7 +70,7 @@ describe("TASK 4.5-A-FIX-2 — Executor integration (public)", function () {
       const result = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), makeWallet(sent), makeProvider(), { nonceManager: manager });
       expect(result.ok).to.equal(false);
       expect(result.reason).to.equal("nonce-commit-failed");
-      expect(result.txHash).to.equal("0x" + "tx".repeat(10));
+      expect(result.txHash).to.equal("0x" + "ab".repeat(32));
       expect(rollbackSpy.length).to.equal(0);
       expect(sent[0].nonce).to.equal(7);
     });
@@ -108,7 +109,7 @@ describe("TASK 4.5-A-FIX-2 — Executor integration (public)", function () {
       const sent = [];
       const manager = { async reserve() { return 7; }, commit(n, h) { throw new Error("simulated-commit-failure"); }, rollback(n) {} };
       const result = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), makeWallet(sent), makeProvider(), { nonceManager: manager });
-      expect(result.txHash).to.equal("0x" + "tx".repeat(10));
+      expect(result.txHash).to.equal("0x" + "ab".repeat(32));
     });
   });
 
@@ -151,7 +152,7 @@ describe("TASK 4.5-A-FIX-2 — Executor integration (public)", function () {
         // D: reason
         expect(result.reason).to.equal("nonce-commit-failed");
         // E: txHash preserved
-        expect(result.txHash).to.equal("0x" + "tx".repeat(10));
+        expect(result.txHash).to.equal("0x" + "ab".repeat(32));
         // F: rollback NOT called
         expect(rollbackSpy.length).to.equal(0);
       });

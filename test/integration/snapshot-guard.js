@@ -233,6 +233,7 @@ describe("TASK 4.2-A — snapshot guard + integration", function () {
       return {
         getBlockNumber: async () => 100,
         getFeeData: async () => ({ gasPrice: 1n }),
+        getNetwork: async () => ({ chainId: 56n }),
       };
     }
 

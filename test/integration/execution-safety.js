@@ -398,7 +398,7 @@ describe("TASK 4.6-A — Economic execution safety", function () {
       require.cache[SCAN] = { id: SCAN, filename: SCAN, loaded: true, exports: { readState: async () => {}, pairKey: (a, b) => a + b } };
       require.cache[BX] = { id: BX, filename: BX, loaded: true, exports: {
         isAvailable: async () => opts.available !== false,
-        sendPrivateTx: opts.sendPrivateTx || (async () => ({ ok: true, status: "accepted", txHash: "0x" + "aa".repeat(32), block: 1 })),
+        sendPrivateTx: opts.sendPrivateTx || (async () => ({ ok: true, status: "accepted", txHash: "0x" + "aa".repeat(32), signedHash: "0x" + "aa".repeat(32), block: 1 })),
       } };
       delete require.cache[EX];
       const executor = require("../../bot/executor");
@@ -412,10 +412,14 @@ describe("TASK 4.6-A — Economic execution safety", function () {
     }
 
     function wallet(sent) {
-      return { address: "0x" + "e1".repeat(20), getAddress: async () => "0x" + "e1".repeat(20), getNonce: async () => 100, call: async () => "0x" + "00".repeat(31) + "7b", estimateGas: async () => 100000n, sendTransaction(tx) { sent.push(tx); return { hash: "0x" + "tx".repeat(10) }; } };
+      return { address: "0x" + "e1".repeat(20), getAddress: async () => "0x" + "e1".repeat(20), getNonce: async () => 100, call: async () => "0x" + "00".repeat(31) + "7b", estimateGas: async () => 100000n, sendTransaction(tx) { sent.push(tx); return { hash: "0x" + "ab".repeat(32) }; } };
     }
     function provider() {
-      return { getBlockNumber: async () => 100, getFeeData: async () => ({ gasPrice: 1n }) };
+      return {
+        getBlockNumber: async () => 100,
+        getFeeData: async () => ({ gasPrice: 1n }),
+        getNetwork: async () => ({ chainId: 56n }),
+      };
     }
     function unprofitableOpp() {
       return makeV2Opp({ sellVen: v2Venue("0x" + "c3".repeat(20), tokWbnb, tokBase, 1_000_000n * E18, 1_000_000n * E18) });
@@ -437,7 +441,7 @@ describe("TASK 4.6-A — Economic execution safety", function () {
     });
     it("54. economic failure → sendPrivateTx NOT called", async function () {
       let calls = 0;
-      await isolate({ sendPrivateTx: async () => { calls++; return { ok: true, status: "accepted", txHash: "0x" + "bb".repeat(32) }; } }, async (executor) => {
+      await isolate({ sendPrivateTx: async () => { calls++; return { ok: true, status: "accepted", txHash: "0x" + "bb".repeat(32), signedHash: "0x" + "bb".repeat(32) }; } }, async (executor) => {
         await executor.executeOpp(unprofitableOpp(), "0x" + "f1".repeat(20), wallet([]), provider(), {});
       });
       expect(calls).to.equal(0);

@@ -19,6 +19,7 @@ const scanner = require("./scanner");
 const profit = require("./profit");
 const executionSafety = require("./execution-safety");
 const executionCost = require("./execution-cost");
+const broadcastIntegrity = require("./broadcast-integrity");
 const logger = require("./logger");
 
 const iface = new ethers.Interface(abi);
@@ -259,6 +260,35 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
   }
   const gasLimit = cost.gasLimit;
 
+  // ---- 5b. BROADCAST INTEGRITY — CONTENT APPROVAL (TASK 4.6-D) --------------
+  // Aprobarea conținutului: chainId/to/data/value/gasLimit validate + fingerprint
+  // canonic ÎNAINTE de rezervarea nonce-ului. Orice mutație ulterioară a
+  // acestor câmpuri (inclusiv 1 byte din calldata) invalidează identitatea la
+  // verificare => NO BROADCAST (fail-closed).
+  const content = broadcastIntegrity.approveContent({
+    chainId: config.chainId,
+    to: contractAddr,
+    data,
+    value: 0n,
+    gasLimit,
+  });
+  if (!content.ok) {
+    return { ok: false, reason: content.rejection.code, details: content.rejection.reason };
+  }
+  // RPC CONSISTENCY (PHASE 6/13): rețeaua provider-ului care va face estimarea
+  // și broadcast-ul trebuie să corespundă chainId-ului aprobat (56 = BSC
+  // mainnet). Lipsă/malformat/mismatch => NO BROADCAST, fail-closed.
+  let network = null;
+  try {
+    network = await provider.getNetwork();
+  } catch (_) {
+    network = null; // indisponibil => fail-closed mai jos
+  }
+  const chainCheck = broadcastIntegrity.verifyProviderNetwork(content.content, network);
+  if (!chainCheck.ok) {
+    return { ok: false, reason: chainCheck.rejection.code, details: chainCheck.rejection.reason };
+  }
+
   // ---- 6. NONCE RESERVATION (PHASE 11) --------------------------------------
   // TASK 4.2-B — contractul de dependency injection:
   //   opts.nonceManager PREZENT  => se folosește EXACT obiectul injectat (chiar
@@ -293,6 +323,54 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     return { ok: false, reason: "nonce-saturation" };
   }
 
+  // ---- 6a. BROADCAST INTEGRITY — FULL TX IDENTITY APPROVAL (TASK 4.6-D) -----
+  // Nonce-ul face parte din identitate, deci aprobarea COMPLETĂ se face după
+  // rezervare și ÎNAINTE de tracker/submit. Eșec aici => rollback (nonce-ul nu
+  // a fost niciodată broadcast) + NICIUN record tracker (PHASE 26).
+  // Fee/type per cale de submisie: privat = EIP-1559 (bound-ul validat 4.6-C
+  // ca maxFeePerGas, tip sanitizat ≤ bound), public = legacy (același bound ca
+  // gasPrice). Fiecare cale de submisie primește o identitate completă
+  // RE-APROBATĂ care păstrează EXACT conținutul aprobat la 5b (verifyContent).
+  // Tipul face parte din identitate — 0↔2 este o re-aprobare completă explicită,
+  // niciodată o mutație tăcută (PHASE 12).
+  const useBloxroute = await bloxroute.isAvailable();
+  let approval = null;
+  if (useBloxroute) {
+    const priorityRaw = executionCost.validateGasUnits(feeData.maxPriorityFeePerGas);
+    const priorityTip = priorityRaw !== null && priorityRaw > 0n && priorityRaw <= fee.priceWei ? priorityRaw : 0n;
+    approval = broadcastIntegrity.approveTx({
+      chainId: config.chainId,
+      to: contractAddr,
+      data,
+      value: 0n,
+      nonce,
+      gasLimit,
+      type: 2,
+      maxFeePerGas: fee.priceWei, // bound-ul worst-case VALIDAT (audit F1 4.6-C)
+      maxPriorityFeePerGas: priorityTip, // sanitizat, ≤ bound (audit F2 4.6-C)
+    });
+  } else {
+    approval = broadcastIntegrity.approveTx({
+      chainId: config.chainId,
+      to: contractAddr,
+      data,
+      value: 0n,
+      nonce,
+      gasLimit,
+      type: 0,
+      gasPrice: fee.priceWei, // același bound validat (4.6-C)
+    });
+  }
+  if (!approval.ok) {
+    try { nonceMgr.rollback(nonce); } catch (_) {}
+    return { ok: false, reason: approval.rejection.code, details: approval.rejection.reason, nonce };
+  }
+  const contentCheck = broadcastIntegrity.verifyContent(content.content, approval.tx);
+  if (!contentCheck.ok) {
+    try { nonceMgr.rollback(nonce); } catch (_) {}
+    return { ok: false, reason: contentCheck.rejection.code, details: contentCheck.rejection.reason, nonce };
+  }
+
   // ---- 6b. TRANSACTION TRACKER (TASK 4.5-D §20) -----------------------------
   // Tracker-ul este AUTORITATEA pentru ciclul de viață al tranzacției.
   // Recordul se creează DUPĂ rezervare și ÎNAINTE de orice submisie:
@@ -322,36 +400,46 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     try { fn(); } catch (e) { logger.error(`[executor] tracker error: ${e.message}`); }
   };
 
+  // TASK 4.6-D (PHASE 19): record-ul tracker-ului trebuie să porteze EXACT
+  // identitatea aprobată (nonce legat; orice nepotrivire => fail-closed).
+  const recBind = broadcastIntegrity.verifyTrackerRecord(tracker.get(recId), approval.tx);
+  if (!recBind.ok) {
+    track(() => tracker.transition(recId, "UNKNOWN", { lastError: `integrity: ${recBind.rejection.code}` }));
+    try { nonceMgr.rollback(nonce); } catch (_) {}
+    return { ok: false, reason: recBind.rejection.code, details: recBind.rejection.reason, nonce };
+  }
+
   // ---- 7. SUBMISIE (privat cu fallback SIGUR) -------------------------------
-  // TASK 4.6-C AUDIT FIX (F1/F2): parametrii de fee către relay sunt derivați
-  // DIN BOUND-UL VALIDAT, nu din feeData raw. Astfel gar price == submitted
-  // bound garantat: un maxFeePerGas/malformed din feeData nu poate ocoli
-  // economic guard-ul ajungând semnat în tranzacție. Tip-ul este sanitizat la
-  // un BigInt valid ≤ bound (EIP-1559 plafonează oricum efectiv la maxFeePerGas).
-  const useBloxroute = await bloxroute.isAvailable();
+  // TASK 4.6-D: parametrii trimiși relay-ului provin EXCLUSIV din identitatea
+  // aprobată (approval.tx) — exact reprezentarea canonică validată economic,
+  // simulată, estimată și track-uită. Relay-ul NU poate reconstrui tăcut
+  // to/data/nonce/gasLimit/fee (bot/bloxroute.js validează + semnează exact
+  // acești parametri și expune signedHash pentru legare).
   if (useBloxroute) {
-    const priorityRaw = executionCost.validateGasUnits(feeData.maxPriorityFeePerGas);
-    const priorityTip = priorityRaw !== null && priorityRaw > 0n && priorityRaw <= fee.priceWei ? priorityRaw : 0n;
     const result = await bloxroute.sendPrivateTx({
       wallet,
-      to: contractAddr,
-      data,
-      gasLimit,
-      maxFeePerGas: fee.priceWei, // bound-ul worst-case VALIDAT (audit F1)
-      maxPriorityFeePerGas: priorityTip, // sanitizat, ≤ bound (audit F2)
+      to: approval.tx.to,
+      data: approval.tx.data,
+      gasLimit: approval.tx.gasLimit,
+      maxFeePerGas: approval.tx.maxFeePerGas,
+      maxPriorityFeePerGas: approval.tx.maxPriorityFeePerGas,
       targetBlock: opts.targetBlock,
       nonce,
     });
     if (result.ok && result.status === "accepted") {
       // Private submission ACCEPTED — relay acceptance ≠ on-chain success
-      // (TASK 4.5-D §18). Track the submission; a missing/malformed hash makes
-      // the acceptance AMBIGUOUS → tombstone commit, never a rollback.
+      // (TASK 4.5-D §18). TASK 4.6-D (PHASE 18): hash-ul trebuie să fie
+      // format-valid și, când relay-ul expune signedHash, IDENTIC cu hash-ul
+      // tranzacției semnate local; altfel acceptarea rămâne AMBIGUĂ → tracker
+      // UNKNOWN + tombstone commit (niciodată rollback, niciodată fallback
+      // public — tranzacția POATE fi deja în drum spre validatori).
+      const idc = broadcastIntegrity.verifyRelayIdentity(result);
       let usableHash = null;
-      if (result.txHash) {
-        track(() => tracker.markSubmitted(recId, result.txHash, { wallet: trader, mode: "private" }));
-        usableHash = result.txHash;
+      if (idc.ok) {
+        track(() => tracker.markSubmitted(recId, idc.hash, { wallet: trader, mode: "private" }));
+        usableHash = idc.hash;
       } else {
-        track(() => tracker.transition(recId, "UNKNOWN", { lastError: "relay accepted without usable txHash" }));
+        track(() => tracker.transition(recId, "UNKNOWN", { lastError: `relay identity unverifiable (${idc.code})` }));
       }
       // Commit MUST succeed. FAIL-CLOSED: if commit throws, nonce is blocked
       // forever (never rolled back).
@@ -363,7 +451,11 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
         // NEVER rollback. Return explicit failure.
         return { ok: false, reason: "nonce-commit-failed", nonce, txHash: result.txHash, private: true, err: e.message };
       }
-      return { ok: true, txHash: result.txHash, blockNumber: result.block, profit: fq.final.net, minProfit: fq.final.minProfit, private: true, nonce, trackerId: recId };
+      if (!idc.ok) {
+        logger.warn(`[executor] relay identity unverifiable (${idc.code}) (nonce=${nonce}) — tracker UNKNOWN, NU se face fallback public`);
+        return { ok: false, reason: "relay-identity-unknown", err: idc.code, nonce, txHash: result.txHash || null, trackerId: recId };
+      }
+      return { ok: true, txHash: usableHash, blockNumber: result.block, profit: fq.final.net, minProfit: fq.final.minProfit, private: true, nonce, trackerId: recId, txFingerprint: approval.fingerprint };
     }
     if (result.status === "unknown") {
       // Private submission UNKNOWN — no txHash, but nonce may still be used.
@@ -384,26 +476,66 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     logger.warn(`[executor] bloxroute failed (definitiv), fallback public: ${result.error}`);
   }
 
-  try {
-    const tx = await wallet.sendTransaction({
+  // ---- 7b. PUBLIC PATH (cale principală sau fallback SIGUR) — 4.6-D ---------
+  // Fallback public este permis DOAR după eșec DEFINITIV de relay (4.5-D).
+  // Tranzacția publică primește propria identitate completă (legacy) re-aprobată
+  // prin approveTx; verifyContent garantează că chainId/to/data/value/gasLimit
+  // rămân EXACT conținutul aprobat la 5b — niciodată o reconstrucție tăcută.
+  let pubApproval = approval;
+  if (useBloxroute) {
+    pubApproval = broadcastIntegrity.approveTx({
+      chainId: config.chainId,
       to: contractAddr,
       data,
+      value: 0n,
+      nonce,
       gasLimit,
-      gasPrice,
+      type: 0,
+      gasPrice: fee.priceWei, // același bound validat (4.6-C) — fee bound NU se schimbă
+    });
+    const pubCheck = pubApproval.ok ? broadcastIntegrity.verifyContent(content.content, pubApproval.tx) : pubApproval;
+    if (!pubCheck.ok) {
+      const rej = pubApproval.ok ? pubCheck.rejection : pubApproval.rejection;
+      track(() => tracker.transition(recId, "UNKNOWN", { lastError: `integrity: ${rej.code}` }));
+      try { nonceMgr.rollback(nonce); } catch (_) {}
+      return { ok: false, reason: rej.code, details: rej.reason, nonce };
+    }
+  }
+  try {
+    const tx = await wallet.sendTransaction({
+      to: pubApproval.tx.to,
+      data: pubApproval.tx.data,
+      gasLimit: pubApproval.tx.gasLimit,
+      gasPrice: pubApproval.tx.gasPrice,
       nonce,
     });
-    // Public broadcast succeeded — txHash exists. Track it, then commit.
+    // TASK 4.6-D (PHASE 18): sendTransaction ≠ confirmare; hash-ul returnat
+    // trebuie să fie format-valid ca să poată fi legat de identitatea aprobată.
+    // Hash malformat/absent => NU putem dovedi legarea => ambiguu: tombstone
+    // commit + tracker UNKNOWN (niciodată rollback, niciodată rebroadcast).
+    const pubHash = broadcastIntegrity.validateTxHash(tx && tx.hash);
+    if (!pubHash) {
+      track(() => tracker.transition(recId, "UNKNOWN", { lastError: "broadcast returned malformed/absent txHash" }));
+      try {
+        nonceMgr.commit(nonce, null);
+      } catch (e) {
+        logger.error(`[executor] nonce commit-tombstone failed (public, nonce=${nonce}): ${e.message}`);
+        return { ok: false, reason: "nonce-commit-failed", nonce, txHash: null, private: false, err: e.message };
+      }
+      return { ok: false, reason: "broadcast-hash-malformed", nonce, txHash: null, trackerId: recId };
+    }
+    // Public broadcast succeeded — txHash valid. Track it, then commit.
     // FAIL-CLOSED: if commit throws, nonce is blocked forever (never rolled back).
-    track(() => tracker.markSubmitted(recId, tx.hash, { wallet: trader, mode: "public" }));
+    track(() => tracker.markSubmitted(recId, pubHash, { wallet: trader, mode: "public" }));
     try {
-      nonceMgr.commit(nonce, tx.hash);
+      nonceMgr.commit(nonce, pubHash);
     } catch (e) {
-      logger.error(`[executor] nonce commit failed (public, nonce=${nonce}, txHash=${tx.hash}): ${e.message}`);
+      logger.error(`[executor] nonce commit failed (public, nonce=${nonce}, txHash=${pubHash}): ${e.message}`);
       // INVARIANT: txHash exists + commit failure = nonce must remain blocked.
       // NEVER rollback. Return explicit failure.
-      return { ok: false, reason: "nonce-commit-failed", nonce, txHash: tx.hash, private: false, err: e.message };
+      return { ok: false, reason: "nonce-commit-failed", nonce, txHash: pubHash, private: false, err: e.message };
     }
-    return { ok: true, txHash: tx.hash, profit: fq.final.net, minProfit: fq.final.minProfit, private: false, nonce, trackerId: recId };
+    return { ok: true, txHash: pubHash, profit: fq.final.net, minProfit: fq.final.minProfit, private: false, nonce, trackerId: recId, txFingerprint: pubApproval.fingerprint };
   } catch (e) {
     // Broadcast failure BEFORE txHash exists — rollback is safe (semantica
     // acceptată în 4.5-A). Tracker: submission attempt recorded as UNKNOWN
