@@ -174,6 +174,11 @@ class TransactionTracker {
       relayId: relayId || null,            // relay request id (NOT the tx hash)
       replaces: null,                      // id of the transaction this one replaces
       replacedBy: null,                    // id of the replacement transaction
+      // TASK 4.8 — explicit, auditable evidence for replacement/dropped classification.
+      // NULL unless an explicit evidence-bearing API was used. Never inferred from
+      // mempool absence, null receipt, or timeout (TASK 4.8 invariants 3-4).
+      replacedEvidence: null,              // { replacerTxHash, nonce, chainId, detectedAt, source } | null
+      droppedEvidence: null,               // { reason, nonce, chainId, detectedAt, source } | null
     };
     this._records.set(id, rec);
     return this._clone(rec);
@@ -258,7 +263,7 @@ class TransactionTracker {
    *   - replacing NEVER frees a nonce (the tracker never touches NonceManager).
    *
    * @param {string} id — original record id
-   * @param {object} opts { txHash, wallet?, relayId?, mode? }
+   * @param {object} opts { txHash, wallet?, relayId?, mode?, evidence? }
    * @returns {object} read-only snapshot of the NEW (replacement) record
    */
   replace(id, opts = {}) {
@@ -270,12 +275,122 @@ class TransactionTracker {
     // Validate EVERYTHING before any mutation (atomicity, TASK 4.5-D §25).
     const h = this._validateTxHash(opts.txHash);
     const m = this._validateMode(opts.mode);
+    // TASK 4.8 — optional explicit evidence: if provided it must be valid AND
+    // bound to the original's nonce; stored on the ORIGINAL record only.
+    let evidence = null;
+    if (opts.evidence !== undefined && opts.evidence !== null) {
+      evidence = this._validateEvidence(opts.evidence, { requireReplacerHash: true });
+      if (evidence.nonce !== old.nonce) {
+        throw new Error(`tracker: replacement evidence nonce ${evidence.nonce} != record nonce ${old.nonce}`);
+      }
+    }
     const snap = this.create({ wallet: old.wallet, nonce: old.nonce, mode: m, relayId: opts.relayId });
     const rec = this._records.get(snap.id);
     rec.replaces = id;
     this.markSubmitted(snap.id, h, { wallet: old.wallet, mode: m, relayId: opts.relayId });
     old.replacedBy = snap.id;
+    if (evidence !== null) old.replacedEvidence = evidence;
     return this._clone(this._records.get(snap.id));
+  }
+
+  /**
+   * TASK 4.8 — explicit REPLACED evidence.
+   *
+   * Marks the ORIGINAL record as definitively replaced by an external
+   * transaction (evidence.replacerTxHash) WITHOUT creating a new internal
+   * record. It is NEVER inferred from null receipt, mempool absence, timeout
+   * or a same-nonce coincidence — the caller must supply explicit, auditable
+   * evidence bound to this record's nonce and chain.
+   *
+   * The original record identity remains IMMUTABLE; the replacement hash is
+   * stored in replacedEvidence and does NOT overwrite the original identity,
+   * does NOT produce CONFIRMED_SUCCESS, and does NOT touch NonceManager.
+   *
+   * @param {string} id
+   * @param {object} evidence { replacerTxHash, nonce, chainId, detectedAt, source }
+   * @param {string} [wallet]
+   * @returns {object} read-only snapshot of the ORIGINAL record
+   */
+  markReplaced(id, evidence, wallet) {
+    const rec = this._getRecord(id);
+    this._checkWallet(rec, wallet);
+    if (rec.state === "CONFIRMED" || rec.state === "REVERTED") {
+      throw new Error(`tracker: cannot mark terminal transaction replaced (${rec.state})`);
+    }
+    const ev = this._validateEvidence(evidence, { requireReplacerHash: true });
+    if (ev.nonce !== rec.nonce) {
+      throw new Error(`tracker: replacement evidence nonce ${ev.nonce} != record nonce ${rec.nonce}`);
+    }
+    rec.replacedEvidence = ev;
+    return this._clone(rec);
+  }
+
+  /**
+   * TASK 4.8 — explicit DROPPED evidence.
+   *
+   * Transitions a non-terminal record to DROPPED ONLY with defensible evidence
+   * (recorded reason + source + nonce + chain + timestamp). NEVER inferred from
+   * null receipt, mempool invisibility, timeout, RPC error or provider
+   * disagreement. Transition + evidence are set atomically.
+   *
+   * @param {string} id
+   * @param {object} evidence { reason, nonce, chainId, detectedAt, source }
+   * @param {string} [wallet]
+   * @returns {object} read-only snapshot AFTER the transition
+   */
+  markDropped(id, evidence, wallet) {
+    const rec = this._getRecord(id);
+    const ev = this._validateEvidence(evidence, { requireReason: true });
+    if (ev.nonce !== rec.nonce) {
+      throw new Error(`tracker: dropped evidence nonce ${ev.nonce} != record nonce ${rec.nonce}`);
+    }
+    this.transition(id, "DROPPED", {}, wallet);
+    this._records.get(id).droppedEvidence = ev;
+    return this._clone(this._records.get(id));
+  }
+
+  /**
+   * TASK 4.8 — validate explicit replacement/dropped evidence.
+   * Fail-closed: missing/malformed fields throw. Replacement evidence requires
+   * a valid replacerTxHash; dropped evidence requires a non-empty reason.
+   * Returns a normalized evidence snapshot.
+   */
+  _validateEvidence(evidence, { requireReplacerHash = false, requireReason = false } = {}) {
+    if (evidence === null || evidence === undefined || typeof evidence !== "object") {
+      throw new Error("tracker: evidence must be an object");
+    }
+    const nonce = evidence.nonce;
+    if (typeof nonce !== "number" || !Number.isInteger(nonce) || nonce < 0) {
+      throw new Error(`tracker: evidence nonce must be a non-negative integer (got ${String(nonce)})`);
+    }
+    const chainId = evidence.chainId;
+    if (typeof chainId !== "number" && typeof chainId !== "bigint") {
+      throw new Error("tracker: evidence chainId required (number or bigint)");
+    }
+    const detectedAt = evidence.detectedAt;
+    if (typeof detectedAt !== "number" || !Number.isFinite(detectedAt)) {
+      throw new Error("tracker: evidence detectedAt required (timestamp)");
+    }
+    const source = evidence.source;
+    if (typeof source !== "string" || source.trim() === "") {
+      throw new Error("tracker: evidence source required (non-empty string)");
+    }
+    const normalized = {
+      nonce,
+      chainId: typeof chainId === "bigint" ? chainId : BigInt(chainId),
+      detectedAt,
+      source: source.trim(),
+    };
+    if (requireReplacerHash) {
+      normalized.replacerTxHash = this._validateTxHash(evidence.replacerTxHash);
+    }
+    if (requireReason) {
+      if (typeof evidence.reason !== "string" || evidence.reason.trim() === "") {
+        throw new Error("tracker: dropped evidence reason required (non-empty string)");
+      }
+      normalized.reason = evidence.reason.trim();
+    }
+    return normalized;
   }
 /**
    * Poll the provider for the current transaction state and transition the
