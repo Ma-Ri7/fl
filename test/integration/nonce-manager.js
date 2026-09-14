@@ -258,8 +258,8 @@ describe("TASK 4.5-A — NonceManager Lifecycle & Single-Owner Discipline", func
       // Nonce-ul este deținut de NonceManager (pending), nu de tracker.
       expect(mgr.pending.has(n)).to.equal(true);
       // Un tracker extern ajunge în PENDING (receipt null) — dar nu atinge nonce-ul.
-      // (reap cu tx:null ar elibera prin logica 4.5-A de mempool-absence, care
-      //  este un mecanism SEPARAT și corect; aici testăm doar decuplarea.)
+      // TASK 4.9: reap() cu receipt null NU eliberează slotul (fail-closed);
+      // absența din mempool nu este dovadă de drop. Aici testăm decuplarea.
       const next = await mgr.reserve();
       expect(next).to.not.equal(n);
       expect(mgr.pending.has(n)).to.equal(true); // încă deținut
@@ -270,8 +270,15 @@ describe("TASK 4.5-A — NonceManager Lifecycle & Single-Owner Discipline", func
       const n = await mgr.reserve();
       mgr.commit(n, "0x" + "cd".repeat(32));
       // Receipt cu status 0 = tranzacție inclusă dar retrasă → nonce consumat.
+      // TASK 4.9-B (LOW-2): receipt-ul trebuie să aparțină hash-ului urmărit
+      // (transactionHash matching), altfel slotul rămâne protejat.
       await mgr.reap(reapProvider({
-        receipt: { status: 0, blockNumber: 500, blockHash: "0x" + "be".repeat(32) },
+        receipt: {
+          status: 0,
+          transactionHash: "0x" + "cd".repeat(32),
+          blockNumber: 500,
+          blockHash: "0x" + "be".repeat(32),
+        },
       }));
       // Nonce-ul a fost inclus (chiar și ca revert) → slot eliberat.
       expect(mgr.pending.has(n)).to.equal(false);
