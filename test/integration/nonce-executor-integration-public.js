@@ -113,16 +113,40 @@ describe("TASK 4.5-A-FIX-2 — Executor integration (public)", function () {
     });
   });
 
-  it("A8: broadcast failure without hash → rollback called, result.ok=false", async function () {
+  it("A8: broadcast transport ambiguity (no node error response) → NO rollback, broadcast-ambiguous", async function () {
+    // TASK 4.11-D (LOW-1): a public broadcast failure with NO structured node
+    // JSON-RPC error response (transport error / timeout / connection reset) —
+    // acceptance cannot be excluded => the nonce MUST stay blocked. The old
+    // semantics (any throw => rollback) is REVERSED for this class.
+    await withIsolatedExecutor(async (executor) => {
+      const rollbackSpy = [];
+      const commitSpy = [];
+      const wallet = makeWallet([]);
+      wallet.sendTransaction = async () => { throw new Error("network error"); };
+      const manager = { async reserve() { return 7; }, commit(n, h, o) { commitSpy.push({ n, h, o }); }, rollback(n) { rollbackSpy.push(n); } };
+      const result = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), wallet, makeProvider(), { nonceManager: manager });
+      expect(result.ok).to.equal(false);
+      expect(result.reason).to.equal("broadcast-ambiguous");
+      expect(rollbackSpy.length).to.equal(0); // nonce NEVER released on ambiguity
+      expect(commitSpy.length).to.equal(1);   // tombstone commit keeps it owned
+      expect(commitSpy[0].n).to.equal(7);
+      expect(commitSpy[0].h).to.equal(null);
+      expect(commitSpy[0].o && commitSpy[0].o.channel).to.equal("public");
+    });
+  });
+
+  it("A8b: definitive node rejection (structured JSON-RPC error) → rollback MAY occur", async function () {
     await withIsolatedExecutor(async (executor) => {
       const rollbackSpy = [];
       const wallet = makeWallet([]);
-      wallet.sendTransaction = async () => { throw new Error("network error"); };
+      // Shape produced by ethers v6 JsonRpcApiProvider.getRpcError() for an
+      // eth_sendRawTransaction ERROR RESPONSE (raw node error at info.error):
+      wallet.sendTransaction = async () => { throw Object.assign(new Error("nonce too low"), { code: "NONCE_EXPIRED", info: { error: { code: -32000, message: "nonce too low" } } }); };
       const manager = { async reserve() { return 7; }, commit(n, h) {}, rollback(n) { rollbackSpy.push(n); } };
       const result = await executor.executeOpp(makeDiOpp(), "0x" + "f1".repeat(20), wallet, makeProvider(), { nonceManager: manager });
       expect(result.ok).to.equal(false);
-      expect(result.reason).to.equal("broadcast-fail");
-      expect(rollbackSpy.length).to.equal(1);
+      expect(result.reason).to.equal("broadcast-failed");
+      expect(rollbackSpy.length).to.equal(1);  // safe rollback preserved for CLASS A
       expect(rollbackSpy[0]).to.equal(7);
     });
   });

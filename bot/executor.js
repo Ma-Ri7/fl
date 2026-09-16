@@ -137,6 +137,32 @@ async function finalRequote(provider, opp, opts = {}) {
 }
 
 /**
+ * TASK 4.11-D (LOW-1) — deterministic classification of public broadcast
+ * failures (see the catch in executeOpp for the full rationale).
+ *
+ * @param {unknown} e  error thrown by wallet.sendTransaction
+ * @returns {"definitive"|"ambiguous"}
+ *   - "definitive": the node demonstrably returned a JSON-RPC ERROR RESPONSE
+ *     for eth_sendRawTransaction (ethers v6 wraps it via getRpcError() and
+ *     ALWAYS attaches the raw node error object at e.info.error) — the
+ *     transaction was refused BEFORE acceptance; rollback is eligible.
+ *   - "ambiguous": everything else (transport error / timeout / connection
+ *     reset / dropped or malformed response / unknown shape). Acceptance
+ *     cannot be excluded — the nonce MUST remain blocked. Fail-closed.
+ */
+function classifyPublicBroadcastError(e) {
+  if (e === null || e === undefined || typeof e !== "object") {
+    return "ambiguous";
+  }
+  // Raw node JSON-RPC error object attached by JsonRpcApiProvider.getRpcError().
+  const raw = e.info && e.info.error;
+  if (raw !== null && raw !== undefined && typeof raw === "object" && typeof raw.code !== "undefined") {
+    return "definitive";
+  }
+  return "ambiguous";
+}
+
+/**
  * Execute one opportunity through the full pipeline.
  * opts.shadow (true) → rulează tot pipeline-ul PÂNĂ la broadcast (PHASE 13).
  * opts.nonceManager  → NonceManager partajat între cicluri.
@@ -550,17 +576,58 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     }
     return { ok: true, txHash: pubHash, profit: fq.final.net, minProfit: fq.final.minProfit, private: false, nonce, trackerId: recId, txFingerprint: pubApproval.fingerprint };
   } catch (e) {
-    // Broadcast failure BEFORE txHash exists — rollback is safe (semantica
-    // acceptată în 4.5-A). Tracker: submission attempt recorded as UNKNOWN
-    // (fail-closed; tracker-ul nu eliberează niciodată nonce-ul).
-    track(() => tracker.transition(recId, "UNKNOWN", { lastError: `broadcast fail: ${e.message}` }));
-    try {
-      nonceMgr.rollback(nonce);
-    } catch (rbErr) {
-      logger.error(`[executor] rollback failed (nonce=${nonce}): ${rbErr.message}`);
+    // TASK 4.11-D (LOW-1) — public broadcast failure classes (fail-closed).
+    //
+    // Deterministic classification based on the REAL ethers v6 (^6.17.0)
+    // contract (verified against lib.commonjs/providers/provider-jsonrpc.js):
+    //   - a successful eth_sendRawTransaction returns the tx hash;
+    //   - a node JSON-RPC error RESPONSE is wrapped by
+    //     JsonRpcApiProvider.getRpcError(), which ALWAYS attaches the raw node
+    //     error object at error.info.error  -> the node PROCESSED and REFUSED
+    //     the request BEFORE acceptance (definitive pre-acceptance rejection);
+    //   - every other throw (transport error, timeout, connection reset,
+    //     dropped/aborted response, missing response, malformed success,
+    //     unknown shape) never carries info.error and the request MAY have been
+    //     accepted => AMBIGUOUS.
+    //
+    // CLASS B semantics (the LOW-1 fix): a transport-ambiguous public broadcast
+    // MUST NOT free the nonce. "No local txHash" does NOT prove the node never
+    // accepted the transaction. On ambiguity we:
+    //   - NEVER rollback / NEVER journal ROLLED_BACK;
+    //   - commit the existing tombstone shape (nonce owned + journal
+    //     SUBMITTED_PUBLIC, outstanding/blocked — same conservative machinery
+    //     as private-relay UNKNOWN, 4.5-D §7);
+    //   - NO automatic retry with the same nonce;
+    //   - NO private fallback after an ambiguous public submission;
+    //   - NO false confirmation / no PnL (no txHash is ever fabricated).
+    // Recovery/observation continues through the existing receipt polling and
+    // startup journal reconciliation (recover() re-blocks unresolved nonces).
+    const kind = classifyPublicBroadcastError(e);
+    track(() => tracker.transition(recId, "UNKNOWN",
+      { lastError: `broadcast ${kind === "definitive" ? "failed (node rejection)" : "ambiguous (transport)"}: ${e.message}` }));
+    if (kind === "definitive") {
+      // CLASS A — the node delivered an explicit error response to
+      // eth_sendRawTransaction: the tx was NEVER accepted. Rollback remains
+      // eligible (existing 4.5-A safe-rollback semantics).
+      try {
+        nonceMgr.rollback(nonce);
+      } catch (rbErr) {
+        logger.error(`[executor] rollback failed (nonce=${nonce}): ${rbErr.message}`);
+      }
+      return { ok: false, reason: "broadcast-failed", err: e.message.slice(0, 120), nonce };
     }
-    return { ok: false, reason: "broadcast-fail", err: e.message.slice(0, 120), nonce };
+    // CLASS B — transport ambiguity: acceptance cannot be excluded.
+    // Commit tombstone (identical conservative pattern to the private-UNKNOWN
+    // path). If the commit itself fails, the nonce stays blocked anyway
+    // (fail-closed; journal state remains APPROVED/outstanding => blocked).
+    try {
+      nonceMgr.commit(nonce, null, { channel: "public" });
+    } catch (ce) {
+      logger.error(`[executor] ambiguity tombstone commit failed (nonce=${nonce}, FAIL-CLOSED, nonce stays blocked): ${ce.message}`);
+    }
+    logger.warn(`[executor] public broadcast AMBIGUOUS (nonce=${nonce}) — nonce blocked, NO retry, NO fallback, awaiting authoritative evidence`);
+    return { ok: false, reason: "broadcast-ambiguous", nonce, err: e.message.slice(0, 120), trackerId: recId };
   }
 }
 
-module.exports = { buildCalldata, buildLeg, simulate, executeOpp, finalRequote };
+module.exports = { buildCalldata, buildLeg, simulate, executeOpp, finalRequote, classifyPublicBroadcastError };
