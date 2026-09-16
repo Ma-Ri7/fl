@@ -7,6 +7,7 @@ const { buildPairs, discoverVenues, readState } = require("./scanner");
 const { findOpportunities } = require("./profit");
 const { executeOpp } = require("./executor");
 const { NonceManager } = require("./nonce");
+const { NonceJournal } = require("./nonce-journal");
 const { trackTransaction } = require("./tracker");
 
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
@@ -68,6 +69,27 @@ async function main(deps = {}) {
 
   let nonceManager = new NonceManagerCtor(wallet, config.bot.maxNonceGap || 5);
   await nonceManager.init();
+  // TASK 4.10-B — durable nonce/transaction journal (închide H1 din 4.10-A):
+  // un nonce rezervat supraviețuiește crash/restart ca rezervare fail-closed
+  // până când există dovezi terminale autoritative. Corupție/ambiguitate =>
+  // bot-ul REFUZĂ pornirea (fail-closed), niciodată „jurnal tratat ca gol”.
+  // Ordine: init() (next din RPC) -> attachJournal() (bump conservator +
+  // pre-block) -> recover() (reconciliere receipt + constrângere finală).
+  try {
+    if (typeof nonceManager.attachJournal === "function") {
+      const journal = new NonceJournal({});
+      nonceManager.attachJournal(journal);
+      const rec = await nonceManager.recover(wallet.provider);
+      logger.info(
+        `Nonce journal: path=${journal.path} outstanding=${rec ? rec.blocked.length : 0} ` +
+        `resolved=${rec ? rec.resolved.length : 0} unknown=${rec ? rec.unknown.length : 0} ` +
+        `next=${nonceManager.next}`
+      );
+    }
+  } catch (e) {
+    logger.error(`Nonce journal recovery failed (fail-closed, refusing to start): ${e.message.slice(0, 160)}`);
+    process.exit(1);
+  }
   logger.info(`NonceManager initialized (maxPending=${nonceManager.maxPending})`);
 
   let venues = [];
@@ -195,6 +217,23 @@ async function main(deps = {}) {
             // stale signer + nonce state from the dead connection.
             nonceManager = new NonceManagerCtor(wallet, config.bot.maxNonceGap || 5);
             await nonceManager.init();
+            // TASK 4.10-B: re-bind jurnalul la reconnect — aceleași reguli
+            // fail-closed ca la pornire (corupție => refuză continuarea;
+            // continuarea fără jurnal ar pierde protejarea nonce-urilor durabile).
+            if (typeof nonceManager.attachJournal === "function") {
+              try {
+                const journal = new NonceJournal({});
+                nonceManager.attachJournal(journal);
+                const rec = await nonceManager.recover(wallet.provider);
+                logger.info(
+                  `Nonce journal re-bound: outstanding=${rec ? rec.blocked.length : 0} ` +
+                  `resolved=${rec ? rec.resolved.length : 0} next=${nonceManager.next}`
+                );
+              } catch (je) {
+                logger.error(`Nonce journal re-bind failed (fail-closed, exiting): ${je.message.slice(0, 160)}`);
+                process.exit(1);
+              }
+            }
             logger.info(`RPC reconnected: ${newUrl} (wallet + NonceManager re-bound)`);
           } catch (e) {
             logger.error(`RPC reconnect failed: ${e.message.slice(0, 80)}`);

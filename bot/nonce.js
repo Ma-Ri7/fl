@@ -3,7 +3,10 @@
 // nonce și reapr nonce-urile blocate (tx never mind / dropped).
 // TASK 4.9-D (LOW-2): import sigur — tx-tracker.js nu are niciun require,
 // deci nu există risc de dependență circulară.
+// TASK 4.10-B: nonce-journal.js nu are niciun import din bot/ (doar fs/path),
+// deci nici aici nu există risc de dependență circulară.
 const { TransactionTracker } = require("./tx-tracker");
+const { NonceJournal } = require("./nonce-journal");
 
 class NonceManager {
   /**
@@ -19,6 +22,11 @@ class NonceManager {
     this.reserved = new Set(); // nonce currently RESERVED (not yet committed/rolled back)
     this.blocked = new Set();  // nonce known on-chain but commit failed — NEVER reusable
     this.lastSync = 0;
+    // TASK 4.10-B — jurnal durabil (opțional). Când este atașat prin
+    // attachJournal(), fiecare schimbare de ownership a nonce-ului este
+    // scrisă durabil (reserve/commit/rollback/releaseDropped/reap) iar
+    // recover() constrânge startup-ul fail-closed.
+    this.journal = null;
 
     // Mutex for atomic reserve(): chains promises so concurrent callers
     // serialize and never read the same this.next value.
@@ -51,6 +59,11 @@ class NonceManager {
       const nonce = this.next;
       this.next += 1;
       this.reserved.add(nonce); // mark RESERVED
+      // TASK 4.10-B (WRITE-BEFORE-RISK): rezervarea durabilă TREBUIE să existe
+      // pe disc ÎNAINTE ca nonce-ul să fie returnat. Dacă scrierea eșuează,
+      // reserve() aruncă — nonce-ul rămâne în `reserved` (leak safe, niciodată
+      // reutilizabil în acest proces) și nu ajunge niciodată la broadcast.
+      if (this.journal) this.journal.reserve(nonce);
       return nonce;
     });
     // Keep the chain alive even if this reserve rejects (shouldn't, but safe).
@@ -69,7 +82,7 @@ class NonceManager {
    *   - nonce was not reserved by this manager (nonce-not-reserved)
    *   - nonce is already committed (nonce-already-committed)
    */
-  commit(nonce, hash) {
+  commit(nonce, hash, opts = {}) {
     const n = Number(nonce);
     if (!this.reserved.has(n)) {
       if (this.pending.has(n)) {
@@ -90,6 +103,14 @@ class NonceManager {
       // let it become "lost" (neither reserved nor pending nor blocked).
       this.blocked.add(n);
       throw e;
+    }
+    // TASK 4.10-B: jurnal durabil — submisia acceptată devine SUBMITTED_*
+    // (hash cunoscut) sau UNKNOWN (tombstone 4.5-D). Dacă scrierea eșuează
+    // AICI, nonce-ul rămâne oricum committed în memorie (deținut) și recordul
+    // RESERVED din jurnal rămâne outstanding => după restart nonce-ul rămâne
+    // blocat (conservator, niciodată reutilizabil).
+    if (this.journal) {
+      this.journal.commit(n, { hash: hash || null, channel: opts.channel });
     }
   }
 
@@ -123,6 +144,13 @@ class NonceManager {
     // Reuse only if this is the most recent nonce and nothing newer is pending.
     if (this.pending.size === 0 && this.next === n + 1) {
       this.next = n;
+    }
+    // TASK 4.10-B: rollback = nicio submisie acceptată (semantica 4.5-A) =>
+    // recordul devine ROLLED_BACK (terminal). Dacă scrierea eșuează, recordul
+    // rămâne outstanding în jurnal => după restart nonce-ul rămâne blocat
+    // (conservator). Eroarea NU propagă — rollback-ul în memorie a reușit deja.
+    if (this.journal) {
+      try { this.journal.rolledBack(n); } catch (_) { /* stale = conservator */ }
     }
   }
 
@@ -299,6 +327,19 @@ class NonceManager {
     if (this.pending.size === 0 && this.next === n + 1) {
       this.next = n;
     }
+    // TASK 4.10-B: dovada DROPPED 4.8/4.9 este suficientă => recordul jurnal
+    // devine DROPPED (terminal) iar nonce-ul scoasă din `blocked` (semantica
+    // 4.9 de reutilizare doar-ca-cea-mai-recentă rămâne intactă). Dacă
+    // scrierea eșuează, recordul rămâne outstanding => după restart blocat
+    // (conservator); `blocked` rămâne setat pentru consistență.
+    if (this.journal) {
+      try {
+        this.journal.terminal(n, "DROPPED", {
+          reason: ev.reason, source: ev.source, chainId: 56, detectedAt: ev.detectedAt,
+        });
+        this.blocked.delete(n);
+      } catch (_) { /* stale = conservator */ }
+    }
     return n;
   }
 
@@ -389,6 +430,153 @@ class NonceManager {
     this._reserveChain = result.catch(() => {});
     return result;
   }
+
+  // -- TASK 4.10-B: durable journal integration -------------------------------
+
+  /**
+   * Atașează un NonceJournal durabil. Validare fail-closed:
+   *   - instanță REALĂ NonceJournal (analog protecției 4.9-D de la tracker);
+   *   - wallet-ul jurnalului trebuie să corespundă managerului (case-insensitive);
+   *   - fișierul este încărcat + validat la atașare — corupție/versiune greșită/
+   *     wallet greșit/chain greșit => JournalError (bot-ul trebuie să refuze
+   *     pornirea, nu să pornească fără protecție);
+   *   - nonce-urile outstanding devin imediat `blocked` (chiar înainte de
+   *     recover()), ca orice reserve() să nu le poată distribui.
+   * NOTĂ despre ordine: apelează init() ÎNAINTE de attachJournal (init
+   * stabilește next din RPC când este null); attachJournal mută next la
+   * max(nonce-uri din jurnal)+1 (conservator), recover() rafinează.
+   */
+  attachJournal(journal) {
+    if (!(journal instanceof NonceJournal)) {
+      throw new Error("invalid-journal: journal must be a real NonceJournal instance");
+    }
+    journal.bindWallet(this.walletAddress, 56);
+    this.journal = journal;
+    let maxJournal = null;
+    for (const r of journal.all()) {
+      maxJournal = maxJournal === null ? r.nonce : Math.max(maxJournal, r.nonce);
+      if (journal.isOutstanding(r)) this.blocked.add(r.nonce);
+    }
+    // next >= max(nonce-uri jurnal) + 1 — niciun nonce durabil nu poate fi
+    // redistribuit, indiferent de starea (outstanding sau terminală) a recordului.
+    if (maxJournal !== null) {
+      this.next = this.next === null ? maxJournal + 1 : Math.max(this.next, maxJournal + 1);
+    }
+    return this;
+  }
+
+  /**
+   * Marchează durabil identitatea aprobată 4.6-D (fingerprint) pentru un nonce
+   * rezervat — întotdeauna ÎNAINTE de submisie. Apelat de executor după
+   * approveTx + verifyContent. Fără jurnal atașat => no-op.
+   */
+  markApproved(nonce, fingerprint) {
+    if (!this.journal) return;
+    this.journal.approve(Number(nonce), fingerprint);
+  }
+
+  /**
+   * TASK 4.10-B — recover(): reconciliere de la pornire împotriva jurnalului
+   * durabil + constrângerea fail-closed a nonce-ului. Închide H1 (4.10-A).
+   *
+   * Pentru fiecare record outstanding (cu txHash):
+   *   (A) receipt valid 4.7 care se potrivește cu txHash => CONFIRMED_SUCCESS /
+   *       CONFIRMED_REVERT (terminal; nonce consumat on-chain);
+   *   (B) tranzacție vizibilă prin RPC (identitate egală) => rămâne blocantă;
+   *   (C) tranzacție nevizibilă (inclusiv submisie privată prin relay) sau
+   *       eroare RPC => UNKNOWN — RĂMÂNE BLOCANTĂ. Niciodată DROPPED din
+   *       absența prin RPC (RPC absence ≠ dovadă de drop).
+   * Tombstone-urile (fără txHash) și recordurile RESERVED/APPROVED (crash
+   * înainte de broadcast) nu pot fi reconciliate => rămân blocante.
+   *
+   * Constrângere finală (§23): next = max(next, chainPending, maxJournalNonce+1)
+   * și TOATE nonce-urile outstanding din jurnal rămân în `blocked` — fiecare
+   * nonce durabil nerezolvat rămâne indisponibil, indiferent de nonce-urile mai
+   * noi care ar putea exista.
+   *
+   * Serializat pe aceeași mutex `_reserveChain` ca reserve()/reconcile().
+   *
+   * @param {object} provider — { getTransactionReceipt, getTransaction? } (opțional)
+   * @returns {Promise<object|null>} report sau null dacă nu există jurnal atașat.
+   */
+  async recover(provider) {
+    if (!this.journal) return null;
+    const run = this._reserveChain.then(async () => {
+      const report = { chainPending: null, resolved: [], unknown: [], blocked: [], maxJournal: null, next: null };
+      // 1) chain pending nonce — best effort; o eroare RPC NU dezactivează
+      // constrângerile din jurnal (fail-closed).
+      try {
+        report.chainPending = this._validateNonce(await this.wallet.getNonce("pending"));
+      } catch (_) {
+        report.chainPending = null;
+      }
+      // 2) reconciliere per record (doar cu txHash; doar dovezi terminale)
+      for (const rec of this.journal.outstanding()) {
+        if (!rec.txHash || !provider || typeof provider.getTransactionReceipt !== "function") continue;
+        let receipt = null;
+        try { receipt = await provider.getTransactionReceipt(rec.txHash); } catch (_) { receipt = null; }
+        if (receipt && this._isConsumedReceipt(receipt, rec.txHash)) {
+          // (A) dovadă mined/reverted autoritativă
+          try {
+            this.journal.terminal(rec.nonce, receipt.status === 1 ? "CONFIRMED_SUCCESS" : "CONFIRMED_REVERT", {
+              status: receipt.status,
+              blockNumber: receipt.blockNumber,
+              blockHash: receipt.blockHash,
+              transactionHash: receipt.transactionHash,
+            });
+            report.resolved.push({ nonce: rec.nonce, status: receipt.status });
+            continue;
+          } catch (_) { /* rămâne outstanding => blocant (conservator) */ }
+        }
+        if (receipt === null) {
+          // (B)/(C): vizibil => rămâne SUBMITTED_* (blocant); nevizibil sau
+          // eroare RPC => UNKNOWN (blocant, niciodată DROPPED).
+          let visible = false;
+          try {
+            const tx = typeof provider.getTransaction === "function"
+              ? await provider.getTransaction(rec.txHash)
+              : null;
+            visible = !!(tx && typeof tx === "object");
+          } catch (_) { visible = false; }
+          if (!visible) {
+            try {
+              this.journal.markUnknown(rec.nonce, "startup-recovery: no receipt, transaction not visible on RPC");
+              report.unknown.push(rec.nonce);
+            } catch (_) { /* rămâne outstanding => blocant */ }
+          }
+        } else {
+          // Receipt prezent dar străin/malformat (nu trece _isConsumedReceipt)
+          // => date RPC inconsistente, nu se poate dovedi nimic => UNKNOWN blocant.
+          try {
+            this.journal.markUnknown(rec.nonce, "startup-recovery: receipt present but identity invalid");
+            report.unknown.push(rec.nonce);
+          } catch (_) { /* rămâne outstanding => blocant */ }
+        }
+      }
+      // 3) constrângere fail-closed a next + blocked
+      for (const rec of this.journal.all()) {
+        report.maxJournal = report.maxJournal === null ? rec.nonce : Math.max(report.maxJournal, rec.nonce);
+        if (this.journal.isOutstanding(rec)) {
+          this.blocked.add(rec.nonce);
+          report.blocked.push(rec.nonce);
+        }
+      }
+      let next = this.next;
+      if (report.chainPending !== null) {
+        next = next === null ? report.chainPending : Math.max(next, report.chainPending);
+      }
+      if (report.maxJournal !== null) {
+        next = next === null ? report.maxJournal + 1 : Math.max(next, report.maxJournal + 1);
+      }
+      this.next = next;
+      report.next = next;
+      this.lastSync = Date.now();
+      return report;
+    });
+    this._reserveChain = run.catch(() => {});
+    return run;
+  }
+
   /**
    * Reap: verifică pending-urile; cele confirmate sau dispărute se șterg.
    * Se apelează la fiecare ciclu de scan.
@@ -429,6 +617,21 @@ class NonceManager {
         //   INVALID / FOREIGN / MALFORMED  => nonce remains protected
         if (receipt && this._isConsumedReceipt(receipt, hash)) {
           this.pending.delete(nonce);
+          // TASK 4.10-B: receipt valid + identity-matched => dovadă terminală
+          // durabilă (CONFIRMED_SUCCESS/REVERT cu dovezi 4.7). Dacă scrierea
+          // eșuează, recordul rămâne outstanding => după restart blocat
+          // (conservator; reconcilierea de la pornire se auto-vindecă prin
+          // același receipt).
+          if (this.journal) {
+            try {
+              this.journal.terminal(Number(nonce), receipt.status === 1 ? "CONFIRMED_SUCCESS" : "CONFIRMED_REVERT", {
+                status: receipt.status,
+                blockNumber: receipt.blockNumber,
+                blockHash: receipt.blockHash,
+                transactionHash: receipt.transactionHash,
+              });
+            } catch (_) { /* stale = conservator */ }
+          }
           continue;
         }
         // TASK 4.9 (LOW-6): receipt == null → PĂSTREAZĂ slotul. NU mai apelăm

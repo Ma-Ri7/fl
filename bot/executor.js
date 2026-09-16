@@ -371,6 +371,19 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     return { ok: false, reason: contentCheck.rejection.code, details: contentCheck.rejection.reason, nonce };
   }
 
+  // ---- 6a-bis. DURABLE JOURNAL — APPROVED (TASK 4.10-B) ----------------------
+  // Identitatea completă 4.6-D este marcată durabil (fingerprint) ÎNAINTE de
+  // orice submisie. Dacă scrierea eșuează, jurnalul rămâne în RESERVED
+  // (outstanding) => nonce-ul rămâne blocat și după restart (conservator);
+  // submisia continuă deoarece ownership-ul durabil există deja din reserve().
+  if (typeof nonceMgr.markApproved === "function") {
+    try {
+      nonceMgr.markApproved(nonce, approval.fingerprint);
+    } catch (e) {
+      logger.warn(`[executor] journal approve failed (nonce=${nonce}): ${e.message.slice(0, 120)}`);
+    }
+  }
+
   // ---- 6b. TRANSACTION TRACKER (TASK 4.5-D §20) -----------------------------
   // Tracker-ul este AUTORITATEA pentru ciclul de viață al tranzacției.
   // Recordul se creează DUPĂ rezervare și ÎNAINTE de orice submisie:
@@ -444,7 +457,7 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
       // Commit MUST succeed. FAIL-CLOSED: if commit throws, nonce is blocked
       // forever (never rolled back).
       try {
-        nonceMgr.commit(nonce, usableHash);
+        nonceMgr.commit(nonce, usableHash, { channel: "private" });
       } catch (e) {
         logger.error(`[executor] nonce commit failed (private, nonce=${nonce}, txHash=${result.txHash}): ${e.message}`);
         // INVARIANT: txHash exists + commit failure = nonce must remain blocked.
@@ -463,7 +476,7 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
       // NEVER rollback (relay may have accepted the tx).
       track(() => tracker.transition(recId, "UNKNOWN", { lastError: result.error }));
       try {
-        nonceMgr.commit(nonce, null);
+        nonceMgr.commit(nonce, null, { channel: "private" });
       } catch (e) {
         logger.error(`[executor] nonce commit-tombstone failed (private, nonce=${nonce}): ${e.message}`);
         // FAIL-CLOSED: commit failure = nonce blocked, never rolled back.
@@ -517,7 +530,7 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     if (!pubHash) {
       track(() => tracker.transition(recId, "UNKNOWN", { lastError: "broadcast returned malformed/absent txHash" }));
       try {
-        nonceMgr.commit(nonce, null);
+        nonceMgr.commit(nonce, null, { channel: "public" });
       } catch (e) {
         logger.error(`[executor] nonce commit-tombstone failed (public, nonce=${nonce}): ${e.message}`);
         return { ok: false, reason: "nonce-commit-failed", nonce, txHash: null, private: false, err: e.message };
@@ -528,7 +541,7 @@ async function executeOpp(opp, contractAddr, wallet, provider, opts = {}) {
     // FAIL-CLOSED: if commit throws, nonce is blocked forever (never rolled back).
     track(() => tracker.markSubmitted(recId, pubHash, { wallet: trader, mode: "public" }));
     try {
-      nonceMgr.commit(nonce, pubHash);
+      nonceMgr.commit(nonce, pubHash, { channel: "public" });
     } catch (e) {
       logger.error(`[executor] nonce commit failed (public, nonce=${nonce}, txHash=${pubHash}): ${e.message}`);
       // INVARIANT: txHash exists + commit failure = nonce must remain blocked.
