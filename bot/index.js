@@ -40,6 +40,208 @@ async function refreshVenues(provider, pairs) {
 // TASK 4.4: V3 deep-state enrichment from scanner
 let lastSnapshot = null;
 const { enrichV3Venues } = require("./scanner");
+// ── TASK 4.11-G-B: WebSocket lifecycle state machine ────────────────────────
+// WS este DOAR trigger de scan: niciodată sursă de adevăr pentru nonce,
+// balances, reserves, prices, transaction state, receipts sau PnL.
+// Reconectarea este availability-only și NU atinge NonceManager /
+// NonceJournal / broadcast / execution gates.
+//
+// Invarianturi (4.11-G-A INFO findings, toate închise aici):
+//   - reconnect nelimitat (nu mai este one-shot după al 2-lea disconnect);
+//   - single-flight: duplicate close/error => cel mult UN reconnect activ;
+//   - gardă anti-stale: evenimentele unui socket vechi sunt ignorate;
+//   - listenerii bot-managed (block/close/error) sunt eliminați la replacement;
+//   - socket 'error' are handler => fără uncaught exception => fără crash;
+//   - LOW-1 (4.11-G-B-C): orice excepție sincronă din rawSock()/attach() este
+//     contenită în failure handling => niciodată blocat permanent în CONNECTING.
+function createWsLifecycle({
+  pickWsProvider,          // async () => { wsProvider, url } (arhitectura existentă)
+  onBlock,                 // (blockNumber) => Promise (producție: trigger scan)
+  logger,                  // { info, warn, error }
+  reconnectDelayMs = 5000, // delay-ul existent, păstrat explicit și controlat
+} = {}) {
+  const ST = { CONNECTED: "CONNECTED", RECONNECT_WAIT: "RECONNECT_WAIT", CONNECTING: "CONNECTING" };
+  let current = null;       // providerul WS activ (referința exterioară, mereu actualizată)
+  let generation = 0;       // generație monotonă — identitate socket / gardă anti-stale
+  let currentAlive = false; // socketul curent este conectat (altfel nu mai declanșează scan)
+  let reconnecting = false; // single-flight: cel mult un reconnect activ
+  let timer = null;         // cel mult un timer de reconnect pending (fără explozie)
+  let state = "DISCONNECTED";
+  const handlers = new Map(); // provider -> { block, close, error } (listeneri bot-managed)
+
+  function isCurrent(ws) { return ws !== null && ws === current && currentAlive; }
+
+  // Raw socket (ethers WebSocketProvider expune .websocket; fallback defensiv).
+  function rawSock(ws) {
+    return ws && typeof ws.websocket === "object" && ws.websocket !== null ? ws.websocket : ws;
+  }
+
+  // Elimină doar listenerul 'block' (socketul mort nu mai declanșează scan-uri).
+  function detachBlock(ws) {
+    const h = handlers.get(ws);
+    if (!ws || !h) return;
+    try { ws.removeListener("block", h.block); } catch (_) { /* best-effort */ }
+  }
+
+  // La replacement: socketul vechi pierde TOȚI listenerii activi bot-managed
+  // (block/close/error) și primește guarduri pasive close/error care doar
+  // consumă și loghează evenimentele târzii — un socket stale nu mai poate
+  // declanșa scan, reconnect și nici măcar un 'error' unhandled (care ar
+  // crash-a procesul). Listenerii interni ethers NU sunt atinși.
+  function retireStale(ws) {
+    const h = handlers.get(ws);
+    if (!ws || !h) return;
+    try { ws.removeListener("block", h.block); } catch (_) { /* best-effort */ }
+    const swallow = (ev) => () =>
+      logger.warn(`WS stale ${ev} event ignored (stale generation, current=${generation})`);
+    try {
+      // LOW-1 (4.11-G-B-C): rawSock() poate arunca pe un provider distrus
+      // ("websocket closed") — retragerea unui socket stale rămâne best-effort.
+      const sock = rawSock(ws);
+      sock.removeListener("close", h.close);
+      sock.removeListener("error", h.error);
+      sock.on("close", swallow("close"));
+      sock.on("error", swallow("error"));
+    } catch (_) { /* best-effort */ }
+    handlers.delete(ws);
+  }
+
+  function attach(ws) {
+    const block = (blockNumber) => {
+      // Stale guard: doar socketul curent + viu poate declanșa scan.
+      if (!isCurrent(ws)) return;
+      void Promise.resolve(onBlock(blockNumber)).catch((e) =>
+        logger.error(`WS block handler error: ${e.message.slice(0, 80)}`));
+    };
+    const sock = rawSock(ws); // LOW-1: poate arunca (provider distrus) — prins de apelant
+    const close = () => handleWsFailure(ws, "close");
+    const error = (err) => {
+      logger.warn(`WebSocket error (${err && err.message ? err.message.slice(0, 80) : "unknown"})`);
+      handleWsFailure(ws, "error");
+    };
+    // LOW-1 (4.11-G-B-C): attach atomic — dacă orice înregistrare de listener
+    // aruncă sincron, anulăm complet înregistrarea și propagăm spre failure
+    // handling (niciodată un socket pe jumătate atașat, niciodată excepție
+    // necontenită).
+    try {
+      ws.on("block", block);
+      sock.on("close", close);
+      sock.on("error", error); // 'error' are handler => nu mai ajunge unhandled => fără crash
+      handlers.set(ws, { block, close, error });
+    } catch (e) {
+      try { ws.removeListener("block", block); } catch (_) { /* best-effort */ }
+      try { sock.removeListener("close", close); sock.removeListener("error", error); } catch (_) { /* best-effort */ }
+      handlers.delete(ws);
+      throw e;
+    }
+  }
+
+  // close și error intră în ACEEAȘI logică, idempotentă/single-flight.
+  // Block-listenerul este eliminat imediat (socketul mort nu mai declanșează
+  // scan-uri), dar close/error rămân atașați până la replacement: orice
+  // eveniment târziu e consumat de handler (isCurrent guard), niciodată
+  // unhandled (care ar crash-a procesul — Part J).
+  function handleWsFailure(ws, reason) {
+    if (!isCurrent(ws)) return;  // stale close/error — ignorat, nu poate înlocui curentul
+    if (reconnecting) return;    // duplicate close/error coalesced — un singur flight
+    currentAlive = false;        // socketul curent nu mai declanșează scan-uri
+    detachBlock(ws);             // block listener pleacă imediat de pe socketul morții
+    scheduleReconnect(reason);
+  }
+
+  function scheduleReconnect(reason) {
+    if (reconnecting || timer !== null) return; // single-flight + un singur timer
+    reconnecting = true;
+    state = ST.RECONNECT_WAIT;
+    timer = setTimeout(() => {
+      timer = null;
+      state = ST.CONNECTING;
+      void attemptConnect();
+    }, reconnectDelayMs);
+    logger.warn(`WS ${reason}: reconnect scheduled in ${reconnectDelayMs}ms (single-flight)`);
+  }
+
+  // Un singur pick per flight; eșec => un singur retry re-programat (fără busy-loop).
+  async function attemptConnect() {
+    let picked = null;
+    try {
+      picked = await pickWsProvider();
+    } catch (e) {
+      logger.error(`WS reconnect attempt failed: ${e.message.slice(0, 80)}`);
+    }
+    const newWs = picked && picked.wsProvider ? picked.wsProvider : null;
+    if (newWs) {
+      // LOW-1 (4.11-G-B-C): TOATE operațiile sincrone de connect/attach sunt în
+      // același failure boundary — o excepție din rawSock()/attach() (ex. un
+      // provider ethers distrus: "websocket closed") NU mai scapă ca unhandled
+      // rejection și NU mai lasă lifecycle-ul blocat în CONNECTING
+      // (reconnecting=true, timerPending=false, fără retry viitor).
+      try {
+        const old = current;
+        if (old) retireStale(old); // socketul vechi: 0 listeneri activi + guarduri pasive
+        current = newWs;        // referința exterioară actualizată (nu mai există newWs-orfan)
+        generation += 1;        // noua generație devine current
+        currentAlive = true;
+        attach(newWs);
+        state = ST.CONNECTED;
+        reconnecting = false;
+        logger.info(`WebSocket reconnected (generation=${generation})`);
+        return;
+      } catch (e) {
+        if (current === newWs) currentAlive = false; // socketul respins nu e "current viu"
+        handlers.delete(newWs);                      // fără handleri pentru un socket ne-atașat
+        logger.error(`WS attach/connect failed (generation=${generation}): ${e && e.message ? e.message.slice(0, 80) : "unknown"}`);
+      }
+    }
+    // Failure (pick eșuat SAU attach/connect aruncat): exact UN retry re-programat.
+    reconnecting = false;
+    scheduleReconnect("reconnect-failed");
+  }
+
+  async function start(ws) {
+    if (!ws) return;
+    current = ws;
+    generation = 1;
+    currentAlive = true;
+    try {
+      attach(ws);
+    } catch (e) {
+      // LOW-1 (4.11-G-B-C): un throw sincron la attach-ul inițial nu mai
+      // propagă în main() — WS rămâne availability layer: un singur retry
+      // re-programat (polling/execution-ul nu depinde de WS).
+      currentAlive = false;
+      handlers.delete(ws);
+      logger.error(`WS attach failed at startup: ${e && e.message ? e.message.slice(0, 80) : "unknown"}`);
+      reconnecting = false;
+      scheduleReconnect("startup-attach-failed");
+      return;
+    }
+    state = ST.CONNECTED;
+  }
+
+  // Număr de listeneri bot-managed pe un socket oarecare (0 pentru stale/detached).
+  function botManagedCount(ws) {
+    const h = handlers.get(ws);
+    return h ? { block: 1, close: 1, error: 1 } : { block: 0, close: 0, error: 0 };
+  }
+
+  function inspect() {
+    return {
+      state, generation, currentAlive, reconnecting, timerPending: timer !== null,
+      botManagedCurrent: current ? botManagedCount(current) : { block: 0, close: 0, error: 0 },
+    };
+  }
+
+  return {
+    start,
+    inspect,
+    botManagedCount,
+    get currentProvider() { return current; },
+    get generation() { return generation; },
+    ST,
+  };
+}
+
 
 async function main(deps = {}) {
   if (!CONTRACT_ADDRESS || !PRIVATE_KEY) {
@@ -265,29 +467,20 @@ async function main(deps = {}) {
   // Use WebSocket for real-time blocks if available, otherwise poll
   if (wsProvider) {
     logger.info("Using WebSocket for real-time block notifications");
-    wsProvider.on("block", async (blockNumber) => {
-      currentBlock = blockNumber;
-      await scan();
+    // TASK 4.11-G-B — WS lifecycle robust: state machine cu single-flight
+    // reconnect, gardă anti-stale (generații), cleanup listeneri și handler
+    // "error" (nu mai poate crasha procesul). WS rămâne DOAR trigger de scan —
+    // reconectarea NU atinge nonce/journal/broadcast/execution gates.
+    const wsLifecycle = createWsLifecycle({
+      pickWsProvider,
+      onBlock: async (blockNumber) => {
+        currentBlock = blockNumber;
+        await scan();
+      },
+      logger,
+      reconnectDelayMs: config.bot.wsReconnectDelayMs || 5000,
     });
-
-    // WebSocket reconnection logic
-    wsProvider.websocket.on("close", () => {
-      logger.warn("WebSocket disconnected, attempting reconnect...");
-      setTimeout(async () => {
-        try {
-          const { wsProvider: newWs, url: newUrl } = await pickWsProvider();
-          if (newWs) {
-            newWs.on("block", async (blockNumber) => {
-              currentBlock = blockNumber;
-              await scan();
-            });
-            logger.info(`WebSocket reconnected: ${newUrl}`);
-          }
-        } catch (e) {
-          logger.error(`WebSocket reconnect failed: ${e.message.slice(0, 80)}`);
-        }
-      }, 5000);
-    });
+    await wsLifecycle.start(wsProvider);
   } else {
     logger.info(`Using polling every ${config.bot.pollIntervalMs || 2000}ms`);
     while (true) {
@@ -397,7 +590,7 @@ async function execGuardedOpp(opp, contractAddr, wallet, provider, opts = {}) {
   }
   return executeOpp(opp, contractAddr, wallet, provider, opts);
 }
-module.exports = { main, takeSnapshot };
+module.exports = { main, takeSnapshot, createWsLifecycle };
 
 if (require.main === module) {
   main().catch(e => {
