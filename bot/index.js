@@ -59,8 +59,14 @@ function createWsLifecycle({
   onBlock,                 // (blockNumber) => Promise (producție: trigger scan)
   logger,                  // { info, warn, error }
   reconnectDelayMs = 5000, // delay-ul existent, păstrat explicit și controlat
+  wsIdleTimeoutMs = 60000, // TASK 4.11-H-B: watchdog dead-WS (0/omit => 60s, vezi mai jos)
 } = {}) {
   const ST = { CONNECTED: "CONNECTED", RECONNECT_WAIT: "RECONNECT_WAIT", CONNECTING: "CONNECTING" };
+  if (!Number.isFinite(wsIdleTimeoutMs) || wsIdleTimeoutMs <= 0) {
+    // Fail startup/config dacă timeout-ul watchdog este invalid (niciodată
+    // silent fallback la o valoare arbitrară).
+    throw new Error(`invalid-ws-idle-timeout: ${String(wsIdleTimeoutMs)} (must be a positive number)`);
+  }
   let current = null;       // providerul WS activ (referința exterioară, mereu actualizată)
   let generation = 0;       // generație monotonă — identitate socket / gardă anti-stale
   let currentAlive = false; // socketul curent este conectat (altfel nu mai declanșează scan)
@@ -68,12 +74,112 @@ function createWsLifecycle({
   let timer = null;         // cel mult un timer de reconnect pending (fără explozie)
   let state = "DISCONNECTED";
   const handlers = new Map(); // provider -> { block, close, error } (listeneri bot-managed)
+  const watchdogs = new Map(); // provider -> timer (TASK 4.11-H-B: dead-WS watchdog, max 1 pe generație)
+  // TASK 4.11-H-C (LOW-2-HB): per-attempt invalidation state. Cât timp un
+  // attemptConnect() este în curs, un eșec al subscripției providerului pick-uit
+  // INVALIDEază attempt-ul (connectAttemptFailed semantic) în loc să declanșeze
+  // după finalizare o a doua reconectare. attemptConnect() finalizează doar
+  // dacă subscripția NU a eșuat în fereastra attempt-ului (vezi invariantul):
+  //   A connection attempt is successful only if:
+  //     provider is current, attach completed,
+  //     subscription setup did not fail, generation remains valid.
+  let pendingAttempt = null; // { ws, invalidated } — attempt-ul de conectare în curs
+  // Contoare observabile (doar pentru audit/test — nu modifică comportamentul):
+  //   attemptInvalidations    — eșecuri de subscripție consumate de attempt în curs;
+  //   postFinalizeSubFailures — eșecuri de subscripție ajunse după CONNECTED
+  //                             (rutate prin handleWsFailure, exact un recovery).
+  let attemptInvalidations = 0;
+  let postFinalizeSubFailures = 0;
 
   function isCurrent(ws) { return ws !== null && ws === current && currentAlive; }
+
+  // ── TASK 4.11-H-C (LOW-2-HB) — subscription failure routing (sincronizat cu
+  // lifecycle-ul attemptConnect): orice eșec de subscripție (wrapper-ul `send`
+  // SAU rejection-ul promise-ului `.on("block", ...)`) ajunge AICI. Reguli:
+  //   1. eșec al providerului care ESTE attempt-ul în curs → invalidate attempt-ul
+  //      (attemptConnect() va termina ca failure, fără CONNECTED tranzitoriu);
+  //   2. eșec al providerului CONNECTED curent → handleWsFailure (normal path);
+  //   3. eșec stale / provider necurrent → ignorat (niciodată un reconnect nou).
+  function notifySubscriptionFailure(ws) {
+    if (pendingAttempt && pendingAttempt.ws === ws) {
+      pendingAttempt.invalidated = true; // consumat de attempt — fără al doilea flight
+      return;
+    }
+    if (isCurrent(ws)) {
+      postFinalizeSubFailures += 1;
+      handleWsFailure(ws, "subscription-failed");
+    }
+  }
+
+  // ── TASK 4.11-H-B — dead-WS watchdog ──────────────────────────────────────
+  // WS "CONNECTED dar fără block events" (subscription moartă) NU este o conexiune
+  // validă. Watchdog-ul este STRICT WS-availability: NU execută scan(), NU atinge
+  // nonce/journal/broadcast — doar detectează lipsa de activitate și rutează spre
+  // aceeași single-flight reconnect machinery (handleWsFailure). Un singur timer
+  // per generație; la block valid timerul se resetează; la retire/failure se curăță.
+  function armWatchdog(ws) {
+    clearWatchdog(ws);
+    if (!isCurrent(ws)) return;
+    const w = setTimeout(() => {
+      watchdogs.delete(ws);
+      logger.warn(`WS watchdog: no block events for ${wsIdleTimeoutMs}ms (generation=${generation}) — treating as WS failure`);
+      handleWsFailure(ws, "subscription-idle");
+    }, wsIdleTimeoutMs);
+    // never hold the event loop open purely for the watchdog
+    if (typeof w.unref === "function") { try { w.unref(); } catch (_) { /* best-effort */ } }
+    watchdogs.set(ws, w);
+  }
+  function bumpWatchdog(ws) {
+    if (isCurrent(ws) && watchdogs.has(ws)) armWatchdog(ws); // reset window (re-arm, 1 timer)
+  }
+  function clearWatchdog(ws) {
+    const w = watchdogs.get(ws);
+    if (w) { clearTimeout(w); watchdogs.delete(ws); }
+  }
 
   // Raw socket (ethers WebSocketProvider expune .websocket; fallback defensiv).
   function rawSock(ws) {
     return ws && typeof ws.websocket === "object" && ws.websocket !== null ? ws.websocket : ws;
+  }
+
+  // ── TASK 4.11-H-B — eth_subscribe rejection containment (la sursă) ─────────
+  // ethers v6: SocketSubscriber.start() face
+  //   `#filterId = provider.send("eth_subscribe", filter).then((fid) => { provider._register(fid, this); return fid; })`
+  // — promise derivată LĂSATĂ fire-and-forget într-un câmp PRIVAT. Dacă
+  // `send("eth_subscribe")` se respinge, atât promise-ul brut CÂT ȘI cel derivat
+  // `#filterId` rejectează; `#filterId` nu are niciun handler => unhandledRejection
+  // (Node>=15 implicit = crash). Verificat empiric: nici `.catch(on-return)` nu
+  // conține rejection-ul derivat.
+  // Soluția la sursă, în lifecycle: pentru `eth_subscribe` returnăm un promise
+  // care NICIODATĂ nu rejectează — la failure se rezolvă cu un sentinel
+  // (`undefined`) => `#filterId` se rezolvă (fără unhandled), `_register` nu
+  // aruncă (Map.set toleră undefined), iar noi rutăm eșecul imediat în aceeași
+  // failure boundary (subscription-failed => WS failure => reconnect), cu guard
+  // de generație pentru rejection-uri stale. NU atinge nonce/journal/broadcast.
+  function guardSubscription(ws) {
+    if (!ws || typeof ws.send !== "function" || ws.__hbWsGuard) return;
+    try {
+      ws.__hbWsGuard = true;
+      const origSend = ws.send;
+      ws.send = (method, params) => {
+        const p = origSend.call(ws, method, params);
+        if (method !== "eth_subscribe" || !p || typeof p.then !== "function") return p;
+        return p.then(
+          (fid) => fid,                                // succes: filterId real, fluxul normal
+          (err) => {
+            // failure consumat AICI (promise-ul returnat se rezolvă): nu mai
+            // există unhandledRejection (nici brut, nici derivat #filterId).
+            // LOW-2-HB: eșecul este sincronizat cu lifecycle-ul (notifySubscription
+            // Failure): attempt în curs → invalidat (fără CONNECTED tranzitoriu,
+            // fără al doilea flight); după CONNECTED → handleWsFailure (exact un
+            // recovery); stale → ignorat. Promise-ul returnat resolve (sentinel).
+            logger.warn(`WS subscription rejected (${err && err.message ? err.message.slice(0, 80) : "unknown"}) — treating as WS failure`);
+            notifySubscriptionFailure(ws);
+            return undefined;                          // sentinel: resolve, nu reject
+          },
+        );
+      };
+    } catch (_) { /* best-effort: fără wrapper, watchdog-ul acoperă totuși dead-CONNECTED */ }
   }
 
   // Elimină doar listenerul 'block' (socketul mort nu mai declanșează scan-uri).
@@ -92,6 +198,7 @@ function createWsLifecycle({
     const h = handlers.get(ws);
     if (!ws || !h) return;
     try { ws.removeListener("block", h.block); } catch (_) { /* best-effort */ }
+    clearWatchdog(ws);                                      // TASK 4.11-H-B: watchdog-ul urmează socketul
     const swallow = (ev) => () =>
       logger.warn(`WS stale ${ev} event ignored (stale generation, current=${generation})`);
     try {
@@ -110,6 +217,7 @@ function createWsLifecycle({
     const block = (blockNumber) => {
       // Stale guard: doar socketul curent + viu poate declanșa scan.
       if (!isCurrent(ws)) return;
+      bumpWatchdog(ws); // TASK 4.11-H-B: activitate block valid => watchdog resetat (fără false positives)
       void Promise.resolve(onBlock(blockNumber)).catch((e) =>
         logger.error(`WS block handler error: ${e.message.slice(0, 80)}`));
     };
@@ -123,8 +231,9 @@ function createWsLifecycle({
     // aruncă sincron, anulăm complet înregistrarea și propagăm spre failure
     // handling (niciodată un socket pe jumătate atașat, niciodată excepție
     // necontenită).
+    let sub = null;
     try {
-      ws.on("block", block);
+      sub = ws.on("block", block);
       sock.on("close", close);
       sock.on("error", error); // 'error' are handler => nu mai ajunge unhandled => fără crash
       handlers.set(ws, { block, close, error });
@@ -134,6 +243,19 @@ function createWsLifecycle({
       handlers.delete(ws);
       throw e;
     }
+    // TASK 4.11-H-B/H-C — subscription failure containment:
+    // `ws.on("block", ...)` la ethers v6 este async (returnează un promise care
+    // se rezolvă la activarea subscripției și se RESPINGE dacă eth_subscribe
+    // eșuează). Un astfel de rejection NU trebuie să devină unhandledRejection —
+    // eșecul subscripției este un WS failure (nu o conexiune sănătoasă).
+    // LOW-2-HB: routing sincronizat (notifySubscriptionFailure) — eșec în
+    // attempt-ul în curs => invalidare; eșec după CONNECTED => handleWsFailure;
+    // rejection târziu de la un provider stale => ignorat (isCurrent guard).
+    if (sub && typeof sub.then === "function" && typeof sub.catch === "function") {
+      sub.catch(() => notifySubscriptionFailure(ws));
+    }
+    armWatchdog(ws); // TASK 4.11-H-B: watchdog dead-WS pornit pe noul socket current
+    return sub;
   }
 
   // close și error intră în ACEEAȘI logică, idempotentă/single-flight.
@@ -145,6 +267,7 @@ function createWsLifecycle({
     if (!isCurrent(ws)) return;  // stale close/error — ignorat, nu poate înlocui curentul
     if (reconnecting) return;    // duplicate close/error coalesced — un singur flight
     currentAlive = false;        // socketul curent nu mai declanșează scan-uri
+    clearWatchdog(ws);           // TASK 4.11-H-B: watchdog-ul socketului mort este oprit
     detachBlock(ws);             // block listener pleacă imediat de pe socketul morții
     scheduleReconnect(reason);
   }
@@ -182,13 +305,49 @@ function createWsLifecycle({
         current = newWs;        // referința exterioară actualizată (nu mai există newWs-orfan)
         generation += 1;        // noua generație devine current
         currentAlive = true;
-        attach(newWs);
+        guardSubscription(newWs);   // TASK 4.11-H-B: conține eth_subscribe rejection (la sursă)
+        // TASK 4.11-H-C (LOW-2-HB): attempt-ul curent devine invalidabil de un
+        // eșec de subscripție al providerului pick-uit (connectAttemptFailed).
+        pendingAttempt = { ws: newWs, invalidated: false };
+        const sub = attach(newWs);
+        // LOW-2-HB synchronization point: un singur microtask-rendezvous (NU un
+        // delay, NU polling, NU setTimeout) pentru ca un eșec de subscripție
+        // ALREADY-SETTLED (rejection deja în coada de microtask-uri la attach)
+        // să fie înregistrat în pendingAttempt ÎNAINTE de finalizare. Dacă
+        // `sub` este un promise (ethers v6 `on("block")` async), îl așteptăm:
+        // se rezolvă după ce `subscriber.start()` a apelat send("eth_subscribe"),
+        // deci orice rejection deja determinat a fost deja consumat. Un eșec
+        // care apare DUPĂ finalizare rămâne un runtime failure legitim rutat prin
+        // handleWsFailure (exact un recovery). Invariantul respectat:
+        //   success only if subscription setup did not fail in this attempt.
+        if (sub && typeof sub.then === "function" && typeof sub.catch === "function") {
+          try { await sub.catch(() => {}); } catch (_) { await Promise.resolve(); }
+        } else {
+          await Promise.resolve();
+        }
+        const invalidated = pendingAttempt.invalidated;
+        pendingAttempt = null; // attempt consumat (fie success, fie invalidat)
+        if (invalidated) {
+          // LOW-2-HB: attempt-ul a devenit invalid înainte de finalizare =>
+          // terminate ca failure (fără CONNECTED tranzitoriu, fără al doilea
+          // flight). Cleanup identic cu handleWsFailure + exact UN retry.
+          attemptInvalidations += 1;
+          if (current === newWs) currentAlive = false;
+          clearWatchdog(newWs);
+          try { retireStale(newWs); } catch (_) { /* best-effort */ }
+          logger.error(`WS subscription failed during connect (generation=${generation}) — invalid attempt, scheduling retry`);
+          reconnecting = false;
+          scheduleReconnect("subscription-failed");
+          return;
+        }
         state = ST.CONNECTED;
         reconnecting = false;
         logger.info(`WebSocket reconnected (generation=${generation})`);
         return;
       } catch (e) {
         if (current === newWs) currentAlive = false; // socketul respins nu e "current viu"
+        pendingAttempt = null;                       // TASK 4.11-H-C: attempt consumat de catch
+        clearWatchdog(newWs);                        // TASK 4.11-H-B: curăță watchdog dacă attach a reușit parțial
         handlers.delete(newWs);                      // fără handleri pentru un socket ne-atașat
         logger.error(`WS attach/connect failed (generation=${generation}): ${e && e.message ? e.message.slice(0, 80) : "unknown"}`);
       }
@@ -203,6 +362,7 @@ function createWsLifecycle({
     current = ws;
     generation = 1;
     currentAlive = true;
+    guardSubscription(ws);            // TASK 4.11-H-B: conține eth_subscribe rejection (la sursă, la start)
     try {
       attach(ws);
     } catch (e) {
@@ -210,6 +370,7 @@ function createWsLifecycle({
       // propagă în main() — WS rămâne availability layer: un singur retry
       // re-programat (polling/execution-ul nu depinde de WS).
       currentAlive = false;
+      clearWatchdog(ws);                             // TASK 4.11-H-B: startup-failure curăță watchdog
       handlers.delete(ws);
       logger.error(`WS attach failed at startup: ${e && e.message ? e.message.slice(0, 80) : "unknown"}`);
       reconnecting = false;
@@ -228,7 +389,13 @@ function createWsLifecycle({
   function inspect() {
     return {
       state, generation, currentAlive, reconnecting, timerPending: timer !== null,
+      watchdogPending: current ? watchdogs.has(current) : false,
       botManagedCurrent: current ? botManagedCount(current) : { block: 0, close: 0, error: 0 },
+      // TASK 4.11-H-C (LOW-2-HB) observability counters:
+      //   attemptInvalidations    — eșec de subscripție consumat de attempt în curs;
+      //   postFinalizeSubFailures — eșec de subscripție după CONNECTED (handleWsFailure).
+      attemptInvalidations,
+      postFinalizeSubFailures,
     };
   }
 
@@ -242,6 +409,23 @@ function createWsLifecycle({
   };
 }
 
+
+// TASK 4.11-H-C (LOW-1-HB) — strict wsIdleTimeoutMs resolution for PRODUCTION
+// (the exact path used by main()). Absence detection is EXPLICIT, no truthiness:
+//   - property absent                        => documented default 60000;
+//   - property explicitly `undefined`        => ≡ absent (JS-canonical "no value";
+//     a supplied-but-undefined property is indistinguishable from absence by
+//     design — this is the deliberate, tested semantic);
+//   - any OTHER explicit value               => returned UNCHANGED so that
+//     createWsLifecycle()'s fail-closed validation rejects it (0, negative,
+//     NaN, Infinity, null, "60", false, {} must NEVER silently become 60000).
+function resolveWsIdleTimeoutMs(botConfig) {
+  if (botConfig == null || typeof botConfig !== "object") return 60000;
+  if (!Object.prototype.hasOwnProperty.call(botConfig, "wsIdleTimeoutMs")) return 60000;
+  const v = botConfig.wsIdleTimeoutMs;
+  if (v === undefined) return 60000; // explicitly-supplied undefined ≡ absent (documented)
+  return v;                          // pass-through: factory fails closed on invalid values
+}
 
 async function main(deps = {}) {
   if (!CONTRACT_ADDRESS || !PRIVATE_KEY) {
@@ -479,6 +663,11 @@ async function main(deps = {}) {
       },
       logger,
       reconnectDelayMs: config.bot.wsReconnectDelayMs || 5000,
+      // TASK 4.11-H-C (LOW-1-HB) — strict timeout configuration: `wsIdleTimeoutMs`
+      // este rezolvat explicit (absent/undefined => default 60000 documentat;
+      // orice altă valoare trece NEALTERATĂ la factory, care o respinge fail-closed).
+      // FĂRĂ truthiness coercion — `0`/`null`/`NaN` nu mai pot deveni silent 60000.
+      wsIdleTimeoutMs: resolveWsIdleTimeoutMs(config.bot),
     });
     await wsLifecycle.start(wsProvider);
   } else {
@@ -590,7 +779,7 @@ async function execGuardedOpp(opp, contractAddr, wallet, provider, opts = {}) {
   }
   return executeOpp(opp, contractAddr, wallet, provider, opts);
 }
-module.exports = { main, takeSnapshot, createWsLifecycle };
+module.exports = { main, takeSnapshot, createWsLifecycle, resolveWsIdleTimeoutMs };
 
 if (require.main === module) {
   main().catch(e => {
