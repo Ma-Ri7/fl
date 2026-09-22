@@ -101,7 +101,25 @@ function validateBlockHash(hash) {
   return hash.toLowerCase();
 }
 
-function validateReceipt(receipt, expectedTxHash) {
+/**
+ * TASK 4.11-L-B (F2) — receipt validation + normalization.
+ *
+ * ethers v6 receipts expose the transaction hash as `hash` and the gas price as
+ * `gasPrice`; the legacy/internal/synthetic shape used `transactionHash` /
+ * `effectiveGasPrice`. Both names are accepted (v6 first) and the returned object
+ * is NORMALIZED to the internal names, so downstream accounting is unchanged.
+ *
+ * Identity is REQUIRED for a successful (status 1) receipt: a status-1 receipt with
+ * no verifiable transaction identity is rejected, so no realized PnL can be derived
+ * from an unverifiable observation. A status-0 receipt cannot realize anything, so a
+ * hash-less revert observation remains acceptable (unchanged legacy behaviour).
+ *
+ * @param {object|null} receipt
+ * @param {string} expectedTxHash
+ * @param {object} [opts] { expectedChainId } — chain enforced when the receipt declares one
+ * @returns {object|null} normalized receipt
+ */
+function validateReceipt(receipt, expectedTxHash, opts = {}) {
   if (receipt === null || receipt === undefined) return null;
   if (typeof receipt !== "object") {
     throw new Error("pnl: invalid receipt (not an object)");
@@ -109,32 +127,76 @@ function validateReceipt(receipt, expectedTxHash) {
   if (receipt.status !== 0 && receipt.status !== 1) {
     throw new Error(`pnl: invalid receipt status (${String(receipt.status)})`);
   }
-  // TASK 4.7 (INVARIANT 7): receipt-ul trebuie să aparțină tranzacției
-  // înregistrate. Dacă provider-ul include transactionHash și acesta NU
-  // corespunde txHash-ului înregistrat => receipt străin => FAIL CLOSED.
-  if (receipt.transactionHash != null) {
-    if (typeof receipt.transactionHash !== "string" || !HEX_HASH_RE.test(receipt.transactionHash)) {
-      throw new Error(`pnl: invalid receipt.transactionHash (${String(receipt.transactionHash)})`);
-    }
-  }
+
+  // ---- gas data ------------------------------------------------------------
   if (typeof receipt.gasUsed !== "bigint") {
     throw new Error(`pnl: invalid receipt.gasUsed (${typeof receipt.gasUsed})`);
   }
-  if (typeof receipt.effectiveGasPrice !== "bigint") {
-    throw new Error(`pnl: invalid receipt.effectiveGasPrice (${typeof receipt.effectiveGasPrice})`);
+  // TASK 4.11-L-B (F2): ethers v6 exposes `gasPrice`; accept the legacy name too.
+  const rawGasPrice = receipt.gasPrice != null ? receipt.gasPrice : receipt.effectiveGasPrice;
+  if (typeof rawGasPrice !== "bigint") {
+    throw new Error(`pnl: invalid receipt gas price (gasPrice/effectiveGasPrice: ${typeof rawGasPrice})`);
   }
-  if (
-    receipt.transactionHash != null &&
-    receipt.transactionHash.toLowerCase() !== String(expectedTxHash).toLowerCase()
-  ) {
-    throw new Error("pnl: receipt hash mismatch (foreign receipt)");
+  if (rawGasPrice < 0n) {
+    throw new Error("pnl: invalid receipt gas price (negative)");
   }
+
+  // ---- transaction identity ------------------------------------------------
+  // TASK 4.11-L-B (F2): resolve `hash` (ethers v6) or `transactionHash` (legacy).
+  const rawHash = receipt.hash != null ? receipt.hash : receipt.transactionHash;
+  let receiptHash = null;
+  if (rawHash != null) {
+    if (typeof rawHash !== "string" || !HEX_HASH_RE.test(rawHash)) {
+      throw new Error(`pnl: invalid receipt.transactionHash (${String(rawHash)})`);
+    }
+    receiptHash = rawHash.toLowerCase();
+    if (receiptHash !== String(expectedTxHash).toLowerCase()) {
+      throw new Error("pnl: receipt hash mismatch (foreign receipt)");
+    }
+  } else if (receipt.status === 1) {
+    // A realizing observation MUST carry a verifiable transaction identity.
+    throw new Error("pnl: receipt identity missing (hash/transactionHash required for a successful receipt)");
+  }
+
+  // ---- chain identity ------------------------------------------------------
+  // Enforced whenever the receipt declares one. Real ethers v6 receipts carry no
+  // chain field (the chain is governed by the callers' configured provider), so an
+  // absent field is not treated as a mismatch — validation is never weakened here.
+  if (receipt.chainId !== null && receipt.chainId !== undefined) {
+    let cid = null;
+    try {
+      cid = typeof receipt.chainId === "bigint" ? receipt.chainId : BigInt(receipt.chainId);
+    } catch (_) {
+      cid = null;
+    }
+    if (cid === null) {
+      throw new Error(`pnl: invalid receipt.chainId (${String(receipt.chainId)})`);
+    }
+    const want = opts.expectedChainId === null || opts.expectedChainId === undefined
+      ? 56n
+      : BigInt(opts.expectedChainId);
+    if (cid !== want) {
+      throw new Error(`pnl: receipt chainId ${String(cid)} != expected ${String(want)} (wrong chain)`);
+    }
+  }
+
+  // ---- block anchoring -----------------------------------------------------
+  const blockNumber = validateNonNegativeIntOrNull(receipt.blockNumber, "blockNumber");
+  const blockHash = validateBlockHash(receipt.blockHash);
+  if (receipt.status === 1 && (blockNumber === null || blockHash === null)) {
+    // A successful receipt must be anchored to a block.
+    throw new Error("pnl: successful receipt requires blockNumber and blockHash");
+  }
+
   return {
     status: receipt.status,
     gasUsed: receipt.gasUsed,
-    effectiveGasPrice: receipt.effectiveGasPrice,
-    blockNumber: validateNonNegativeIntOrNull(receipt.blockNumber, "blockNumber"),
-    blockHash: validateBlockHash(receipt.blockHash),
+    effectiveGasPrice: rawGasPrice,   // normalized internal name
+    gasPrice: rawGasPrice,            // ethers v6 name, same BigInt value
+    transactionHash: receiptHash,     // normalized internal name (null for hash-less revert)
+    hash: receiptHash,                // ethers v6 name, same value
+    blockNumber,
+    blockHash,
     transactionIndex: validateNonNegativeIntOrNull(receipt.transactionIndex, "transactionIndex"),
   };
 }

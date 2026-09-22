@@ -465,8 +465,12 @@ class TransactionTracker {
       // TASK 4.7 (INVARIANT 7): receipt-ul trebuie să aparțină tranzacției
       // track-uite. Dacă provider-ul include transactionHash și acesta NU
       // corespunde hash-ului track-uit => receipt străin => UNKNOWN.
-      if (receipt.transactionHash != null) {
-        const rh = typeof receipt.transactionHash === "string" ? receipt.transactionHash.toLowerCase() : null;
+      // TASK 4.11-L-B (§14): ethers v6 exposes the identity as `hash`; resolve either
+      // name so the binding applies to live v6 observations (a hash-less receipt is
+      // still accepted, preserving the existing contract and its fixtures).
+      const observedHash = receipt.hash != null ? receipt.hash : receipt.transactionHash;
+      if (observedHash != null) {
+        const rh = typeof observedHash === "string" ? observedHash.toLowerCase() : null;
         if (rh !== hash.toLowerCase()) {
           return this.transition(id, "UNKNOWN", { lastError: "receipt hash mismatch" });
         }

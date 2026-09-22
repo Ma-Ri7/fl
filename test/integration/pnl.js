@@ -14,7 +14,7 @@ const TX_HASH_3 = "0x" + "c".repeat(64);
 const BLOCK_HASH = "0x" + "d".repeat(64);
 
 function confirmedReceipt(overrides = {}) {
-  return { status: 1, gasUsed: 200000n, effectiveGasPrice: 3000000000n, blockNumber: 100, blockHash: BLOCK_HASH, ...overrides };
+  return { status: 1, gasUsed: 200000n, effectiveGasPrice: 3000000000n, blockNumber: 100, blockHash: BLOCK_HASH, transactionHash: TX_HASH_1, ...overrides };
 }
 
 function revertedReceipt(overrides = {}) {
@@ -22,9 +22,12 @@ function revertedReceipt(overrides = {}) {
 }
 
 function baseData(overrides = {}) {
+  // TASK 4.11-L-B (F2): a successful receipt MUST carry the transaction identity.
+  // The fixture binds the receipt to whatever txHash the case under test uses.
+  const txHash = overrides.txHash || TX_HASH_1;
   return {
-    txHash: TX_HASH_1, wallet: WALLET_A, settlementToken: USDT, settlementDecimals: 6,
-    beforeBalanceRaw: 1000000n, afterBalanceRaw: 1012500n, receipt: confirmedReceipt(), ...overrides,
+    txHash, wallet: WALLET_A, settlementToken: USDT, settlementDecimals: 6,
+    beforeBalanceRaw: 1000000n, afterBalanceRaw: 1012500n, receipt: confirmedReceipt({ transactionHash: txHash }), ...overrides,
   };
 }
 
@@ -120,11 +123,11 @@ describe("TASK 4.5-E — Realized P&L Tracker", function () {
       expect(r.gasCostWei).to.equal(600000000000000n);
     });
     it("20. legacy receipt", function () {
-      const r = tracker.recordPnL(baseData({ receipt: { status: 1, gasUsed: 150000n, effectiveGasPrice: 5000000000n, blockNumber: 100, blockHash: BLOCK_HASH } }));
+      const r = tracker.recordPnL(baseData({ receipt: { status: 1, gasUsed: 150000n, effectiveGasPrice: 5000000000n, blockNumber: 100, blockHash: BLOCK_HASH, transactionHash: TX_HASH_1 } }));
       expect(r.gasCostWei).to.equal(750000000000000n);
     });
     it("21. EIP-1559 receipt", function () {
-      const r = tracker.recordPnL(baseData({ receipt: { status: 1, gasUsed: 250000n, effectiveGasPrice: 3500000000n, blockNumber: 100, blockHash: BLOCK_HASH } }));
+      const r = tracker.recordPnL(baseData({ receipt: { status: 1, gasUsed: 250000n, effectiveGasPrice: 3500000000n, blockNumber: 100, blockHash: BLOCK_HASH, transactionHash: TX_HASH_1 } }));
       expect(r.gasCostWei).to.equal(875000000000000n);
     });
     it("22. gas cost preserved as wei", function () {

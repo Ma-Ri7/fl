@@ -8,6 +8,27 @@
 const { TransactionTracker } = require("./tx-tracker");
 const { NonceJournal } = require("./nonce-journal");
 
+/**
+ * TASK 4.11-L-B (F1) — receipt transaction identity resolution.
+ *
+ * ethers v6 `TransactionReceipt` objects expose the transaction hash as `hash`;
+ * the legacy / internal / synthetic shape used `transactionHash`. The production
+ * recovery paths (reap/recover) call `provider.getTransactionReceipt()`, so they
+ * receive the v6 shape and previously failed to recognise a consumed nonce.
+ *
+ * This helper bridges the two names WITHOUT weakening the identity contract: the
+ * caller still compares the resolved value against the expected hash
+ * (case-insensitively) and rejects anything else.
+ *
+ * @param {object|null} receipt
+ * @returns {string|null} the observed transaction hash, or null when absent/unusable
+ */
+function observedReceiptTxHash(receipt) {
+  if (receipt === null || receipt === undefined || typeof receipt !== "object") return null;
+  const h = receipt.hash != null ? receipt.hash : receipt.transactionHash;
+  return (typeof h === "string" && h.trim() !== "") ? h : null;
+}
+
 class NonceManager {
   /**
    * @param {ethers.Wallet} wallet
@@ -177,8 +198,10 @@ class NonceManager {
    */
   _isConsumedReceipt(receipt, expectedHash) {
     if (receipt === null || receipt === undefined || typeof receipt !== "object") return false;
-    const rh = receipt.transactionHash;
-    if (typeof rh !== "string" || rh.trim() === "") return false;
+    // TASK 4.11-L-B (F1): resolve the identity from `hash` (ethers v6) or
+    // `transactionHash` (legacy/internal shape). Absence => NOT consumed.
+    const rh = observedReceiptTxHash(receipt);
+    if (rh === null) return false;
     if (rh.toLowerCase() !== String(expectedHash).toLowerCase()) return false;
     if (receipt.status !== 1 && receipt.status !== 0) return false;
     if (receipt.blockNumber == null || receipt.blockHash == null) return false;
@@ -522,7 +545,10 @@ class NonceManager {
               status: receipt.status,
               blockNumber: receipt.blockNumber,
               blockHash: receipt.blockHash,
-              transactionHash: receipt.transactionHash,
+              // TASK 4.11-L-B (F1): durable evidence must carry the resolved identity
+              // (`hash` on ethers v6), otherwise journal.terminal rejects the evidence
+              // and the record can never be terminalised.
+              transactionHash: observedReceiptTxHash(receipt) || rec.txHash,
             });
             report.resolved.push({ nonce: rec.nonce, status: receipt.status });
             continue;
@@ -628,7 +654,8 @@ class NonceManager {
                 status: receipt.status,
                 blockNumber: receipt.blockNumber,
                 blockHash: receipt.blockHash,
-                transactionHash: receipt.transactionHash,
+                // TASK 4.11-L-B (F1): resolved identity (ethers v6 `hash`).
+                transactionHash: observedReceiptTxHash(receipt) || hash,
               });
             } catch (_) { /* stale = conservator */ }
           }

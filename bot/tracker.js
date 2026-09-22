@@ -66,8 +66,13 @@ async function trackTransaction(provider, opts = {}) {
       if (receipt && receipt.blockNumber) {
         // INVARIANT 7 — receipt identity binding: transactionHash lipsă sau
         // diferit de hash-ul cerut => observare străină => "unknown".
-        if (receipt.transactionHash != null) {
-          const rh = typeof receipt.transactionHash === "string" ? receipt.transactionHash.toLowerCase() : null;
+        // TASK 4.11-L-B (§14): ethers v6 receipts expose the hash as `hash`; the
+        // legacy/internal shape used `transactionHash`. Resolve either name so the
+        // identity binding is really enforced for live v6 observations instead of
+        // being silently skipped (a hash-less receipt is still not a mismatch).
+        const observedHash = receipt.hash != null ? receipt.hash : receipt.transactionHash;
+        if (observedHash != null) {
+          const rh = typeof observedHash === "string" ? observedHash.toLowerCase() : null;
           if (rh === null || rh !== txHash.toLowerCase()) {
             return { status: "unknown", txHash, lastError: "receipt hash mismatch (foreign receipt)" };
           }
@@ -105,7 +110,9 @@ async function trackTransaction(provider, opts = {}) {
           txHash,
           blockNumber: receipt.blockNumber,
           gasUsed: receipt.gasUsed,
-          effectiveGasPrice: receipt.effectiveGasPrice,
+          // TASK 4.11-L-B (§14): report the resolved gas price (`gasPrice` on v6),
+          // consistent with the gasCostBnb computation above.
+          effectiveGasPrice: receipt.effectiveGasPrice != null ? receipt.effectiveGasPrice : receipt.gasPrice,
           gasCostBnb,
           realizedProfit,
           event: ev,

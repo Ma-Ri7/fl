@@ -38,9 +38,11 @@ function makeExpected(overrides = {}) {
 
 function makePnLRecord(txHash, overrides = {}) {
   const t = new PnLTracker();
+  // TASK 4.11-L-B (F2): a successful receipt must carry the transaction identity.
   return t.recordPnL({
     txHash, wallet: WALLET_A, settlementToken: USDT, settlementDecimals: 6,
-    beforeBalanceRaw: 1000000n, afterBalanceRaw: 1012500n, receipt: confirmedReceipt(), ...overrides,
+    beforeBalanceRaw: 1000000n, afterBalanceRaw: 1012500n,
+    receipt: confirmedReceipt({ transactionHash: txHash }), ...overrides,
   });
 }
 
