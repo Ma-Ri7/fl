@@ -427,6 +427,70 @@ function resolveWsIdleTimeoutMs(botConfig) {
   return v;                          // pass-through: factory fails closed on invalid values
 }
 
+// TASK 4.11-I-C (I-B-A-LOW-1) — strict pollIntervalMs resolution for PRODUCTION (the exact
+// path used by main()'s HTTP polling branch). Absence detection is EXPLICIT, no truthiness:
+//   - property absent                        => documented default 2000;
+//   - property explicitly `undefined`        => ≡ absent (JS-canonical "no value");
+//   - any OTHER explicit value               => must be a positive finite number, else it is
+//     REJECTED fail-closed here (before it can reach runHttpPollingLoop). No coercion
+//     (Number()/parseFloat()/`||`), no silent fallback: -1, 0, NaN, Infinity, -Infinity,
+//     null, true, false, "2000", "", [], {}, and 2000n must NEVER become 2000 or reach the
+//     backoff math (which would otherwise busy-loop or throw an uncaught TypeError).
+function resolvePollIntervalMs(botConfig) {
+  if (botConfig == null || typeof botConfig !== "object") return 2000;
+  if (!Object.prototype.hasOwnProperty.call(botConfig, "pollIntervalMs")) return 2000;
+  const v = botConfig.pollIntervalMs;
+  if (v === undefined) return 2000; // explicitly-supplied undefined ≡ absent (documented)
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+    throw new Error(`invalid-poll-interval: ${String(v)} (must be a positive finite number)`);
+  }
+  return v;
+}
+
+// TASK 4.11-I-B (I-A-LOW-1) — HTTP polling loop with failure containment + bounded backoff.
+// A transient HTTP RPC failure (ECONNRESET/ECONNREFUSED/ETIMEDOUT/500/rate-limit/etc.) MUST
+// NOT terminate the process. The loop stays single-flight (one while-loop, one in-flight
+// getBlockNumber, one sleep timer) and strictly OUTSIDE the execution path: on failure it
+// never calls scan() and never touches nonce/journal/PnL/reconciliation.
+async function runHttpPollingLoop({
+  provider,               // ethers provider exposing getBlockNumber()
+  scan,                   // async () => {} — shared scanner (owns its own mutex)
+  getCurrentBlock,        // () => number
+  setCurrentBlock,        // (number) => void
+  pollIntervalMs = 2000,  // normal poll interval (also the backoff base)
+  logger,                 // { error, warn, info }
+  sleep,                  // (ms) => Promise
+  backoffMs = 30000,      // finite backoff cap (reuses the BACKOFF_MS convention)
+  isDone = () => false,   // test seam: stop predicate (production: never stops)
+} = {}) {
+  let pollingFailures = 0; // consecutive failures (reset on a successful read)
+  while (!isDone()) {
+    try {
+      const blockNumber = await provider.getBlockNumber();
+      pollingFailures = 0; // a healthy RPC read resets the failure/backoff state
+      if (blockNumber !== getCurrentBlock()) {
+        setCurrentBlock(blockNumber);
+        await scan();
+      }
+      await sleep(pollIntervalMs);
+    } catch (e) {
+      // Contain the failure. Bounded exponential backoff with a finite maximum (backoffMs),
+      // increasing with consecutive failures and reset on the next successful read. This is
+      // the ONLY place the polling path sleeps on error — no busy loop on a dead RPC.
+      pollingFailures++;
+      const backoff = Math.min(
+        backoffMs,
+        pollIntervalMs * Math.pow(2, Math.min(pollingFailures - 1, 6))
+      );
+      logger.error(
+        `Polling RPC failure (${pollingFailures} consecutive): ${(e && e.message) ? e.message.slice(0, 120) : String(e)} — retrying in ${backoff}ms`
+      );
+      await sleep(backoff);
+    }
+  }
+  return { pollingFailures };
+}
+
 async function main(deps = {}) {
   if (!CONTRACT_ADDRESS || !PRIVATE_KEY) {
     logger.error("Missing CONTRACT_ADDRESS or PRIVATE_KEY in .env");
@@ -671,15 +735,18 @@ async function main(deps = {}) {
     });
     await wsLifecycle.start(wsProvider);
   } else {
-    logger.info(`Using polling every ${config.bot.pollIntervalMs || 2000}ms`);
-    while (true) {
-      const blockNumber = await provider.getBlockNumber();
-      if (blockNumber !== currentBlock) {
-        currentBlock = blockNumber;
-        await scan();
-      }
-      await sleep(config.bot.pollIntervalMs || 2000);
-    }
+    const pollIntervalMs = resolvePollIntervalMs(config.bot); // fail-closed (throws on invalid)
+    logger.info(`Using polling every ${pollIntervalMs}ms`);
+    await runHttpPollingLoop({
+      provider,
+      scan,
+      getCurrentBlock: () => currentBlock,
+      setCurrentBlock: (bn) => { currentBlock = bn; },
+      pollIntervalMs,
+      logger,
+      sleep,
+      backoffMs: BACKOFF_MS,
+    });
   }
 }
 
@@ -779,7 +846,7 @@ async function execGuardedOpp(opp, contractAddr, wallet, provider, opts = {}) {
   }
   return executeOpp(opp, contractAddr, wallet, provider, opts);
 }
-module.exports = { main, takeSnapshot, createWsLifecycle, resolveWsIdleTimeoutMs };
+module.exports = { main, takeSnapshot, createWsLifecycle, resolveWsIdleTimeoutMs, resolvePollIntervalMs, runHttpPollingLoop };
 
 if (require.main === module) {
   main().catch(e => {
